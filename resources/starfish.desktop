@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Starfish
+GenericName=Raw Photo Editor
+Comment=Develop raw photos with GPU neural demosaicing and denoising
+Exec=starfish %f
+Icon=starfish
+Terminal=false
+Categories=Graphics;Photography;

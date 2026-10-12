@@ -1,0 +1,85 @@
+[package]
+name = "starfish"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Raw photo editor with GPU neural demosaicing and denoising"
+
+[workspace]
+members = ["wgpu-run"]
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+demosaic-run = { path = "wgpu-run" }
+iced = { version = "0.14", features = ["advanced", "canvas", "image", "tokio", "wgpu"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+pollster = "1.0.1"
+rawler = "0.8"
+rfd = "0.17"
+tokio = { version = "1.53.1", features = ["rt"] }
+wgpu = "27"
+
+# DX12 only exposes SHADER_F16 with the DXC compiler; wgpu's default (FXC)
+# would leave Windows on the slower f32 models. Static DXC is not available
+# on Windows on ARM, which keeps FXC (and f32 under DX12).
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+wgpu = { version = "27", features = ["static-dxc"] }
+
+# Installers via cargo-packager (`cargo packager --release`, see README):
+# .app + .dmg on macOS, NSIS .exe installer on Windows, .deb + AppImage on
+# Linux, written to dist/. Each OS packages only its own formats, so CI builds
+# every platform on its own runner. Unsigned for now: no signingIdentity
+# (setting one also makes cargo-packager notarize).
+[package.metadata.packager]
+productName = "Starfish"
+# Reverse DNS of the owning GitHub account; needs no web page. Keep it
+# stable: macOS and Flatpak tie settings and permissions to it.
+identifier = "io.github.monkeypangit.starfish"
+description = "Raw photo editor with GPU neural demosaicing and denoising"
+longDescription = """
+Develops raw photos from Bayer and Fujifilm X-Trans cameras with a joint \
+neural demosaic and denoise on the GPU, lens corrections from the raw file, \
+tone and colour adjustments, crop and JPEG/PNG export."""
+# The Debian package's Maintainer field.
+authors = ["The Starfish contributors"]
+category = "Photography"
+copyright = "Copyright (c) 2026 The Starfish contributors"
+licenseFile = "LICENSE-MIT"
+# THIRD_PARTY_LICENSES.html carries every dependency's licence text, rawler's
+# LGPL-2.1 included, which the binaries must ship with (needs cargo-about).
+beforePackagingCommand = "cargo about generate about.hbs -o THIRD_PARTY_LICENSES.html && cargo build --release"
+outDir = "dist"
+binariesDir = "target/release"
+binaries = [{ path = "starfish", main = true }]
+icons = ["resources/icon/starfish-512.png", "resources/icon/starfish-256.png", "resources/icon/starfish.ico"]
+resources = ["README.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_LICENSES.html"]
+
+[package.metadata.packager.macos]
+# Makes cargo-packager sign the .app (hardened runtime) and the .dmg, and
+# notarize and staple the .app. codesign matches the name as a prefix of the
+# certificate's "Developer ID Application: <name> (<team id>)"; CI imports the
+# only such certificate from the APPLE_CERTIFICATE secret (ci.yml). A Mac
+# without that certificate cannot package.
+signingIdentity = "Developer ID Application"
+minimumSystemVersion = "12.0"
+
+[package.metadata.packager.deb]
+# Our own entry: Exec passes the opened file (`%f`); app id `starfish` (main.rs).
+desktopTemplate = "resources/starfish.desktop"
+# Loaded at run time (dlopen), so not found by the dependency scan.
+depends = ["libvulkan1", "libxkbcommon0"]
+
+# Optimise dependencies in debug builds: raw decoding in an unoptimised
+# rawler is very slow. Our own crate stays at opt-level 0 for debugging.
+[profile.dev.package."*"]
+opt-level = 3
+# The demosaic runner cuts and places windows on the CPU, too slow unoptimised.
+[profile.dev.package.demosaic-run]
+opt-level = 3
+
+# Embeds the icon in the .exe (Explorer, taskbar); see build.rs.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+naga = { version = "27", features = ["wgsl-in"] }

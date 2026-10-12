@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Placeholder logo: a generic five-blade camera iris. -->
+  <defs>
+    <mask id="blades">
+      <circle cx="256.0" cy="256.0" r="196" fill="#fff"/>
+      <polygon points="256.00,184.00 324.48,233.75 298.32,314.25 213.68,314.25 187.52,233.75" fill="#000"/>
+      <g stroke="#000" stroke-width="14" stroke-linecap="butt">
+        <line x1="256.00" y1="184.00" x2="573.13" y2="414.41"/>
+        <line x1="324.48" y1="233.75" x2="203.34" y2="606.56"/>
+        <line x1="298.32" y1="314.25" x2="-93.68" y2="314.25"/>
+        <line x1="213.68" y1="314.25" x2="92.54" y2="-58.56"/>
+        <line x1="187.52" y1="233.75" x2="504.66" y2="3.34"/>
+      </g>
+    </mask>
+  </defs>
+  <rect width="512" height="512" rx="113" fill="#1e1e1e"/>
+  <circle cx="256.0" cy="256.0" r="196" fill="#ffffff" mask="url(#blades)"/>
+</svg>

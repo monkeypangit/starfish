@@ -1,0 +1,26 @@
+# `cargo deny check licenses`: fails when a dependency's licence is not on
+# this list, so a copyleft crate cannot slip in unnoticed. Starfish itself is
+# MIT OR Apache-2.0.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "NCSA",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+# rawler: LGPL-2.1. Linked statically, which is fine for an open-source
+# app: anyone can rebuild Starfish with a modified rawler. Binaries must ship
+# its licence notice (see README).
+[[licenses.exceptions]]
+crate = "rawler"
+allow = ["LGPL-2.1"]

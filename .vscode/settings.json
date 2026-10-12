@@ -1,0 +1,4 @@
+{
+    // Only load this crate; don't also index the iced-material-icon-browser template.
+    "rust-analyzer.linkedProjects": ["Cargo.toml"]
+}

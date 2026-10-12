@@ -1,0 +1,6 @@
+# Install into a venv, with PyTorch's CUDA 12.8 index (Blackwell needs 12.8+):
+#   python -m venv .venv
+#   .venv/bin/pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+numpy==2.5.2
+pillow==12.3.0

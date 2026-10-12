@@ -1,0 +1,150 @@
+# Builds and tests Starfish on every platform it targets. Packaging runs only
+# when started by hand (Actions -> CI -> Run workflow) and keeps the installers
+# as artifacts; run on a `v*` tag, it also collects them into a draft GitHub
+# release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ubuntu, so the packages run on older glibc
+          # (a build on a rolling distro needs the newest glibc).
+          - { os: ubuntu-22.04, name: linux-x86_64, formats: "deb,appimage" }
+          - { os: windows-latest, name: windows-x86_64, formats: nsis }
+          # Apple Silicon only: the Intel build was dropped, as stapling its
+          # notarization ticket kept losing the connection to Apple.
+          - { os: macos-15, name: macos-arm64, formats: "app,dmg" }
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    env:
+      PACKAGE: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        # libfuse2: the AppImage tooling is itself an AppImage
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libfuse2
+      - name: Install cargo-packager and cargo-about
+        if: env.PACKAGE == 'true'
+        run: |
+          cargo install --locked cargo-packager
+          cargo install --locked cargo-about --features cli
+      # Unit tests only: the develop_file test is ignored and needs a raw file
+      # and a GPU, which hosted runners do not have.
+      - run: cargo test --workspace --release
+      # cargo-packager wants the notarization key as a file; the secret holds
+      # the .p8 file's text.
+      - name: Write the notarization key
+        if: env.PACKAGE == 'true' && runner.os == 'macOS'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+      # Generates THIRD_PARTY_LICENSES.html and builds (beforePackagingCommand
+      # in Cargo.toml), then packages into dist/. On macOS it also signs the
+      # .app and .dmg with the APPLE_CERTIFICATE identity and notarizes the
+      # .app; the other runners ignore the Apple variables. Its stapling, right
+      # after notarization, sometimes loses the connection to Apple ("Error
+      # 68"), so macOS tries up to three times (a resubmission is quick).
+      - if: env.PACKAGE == 'true'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          for attempt in 1 2 3; do
+            cargo packager --release --formats ${{ matrix.formats }} && exit 0
+            [ "$RUNNER_OS" = macOS ] || exit 1
+            echo "Packaging failed (attempt $attempt), retrying in 60 s"
+            sleep 60
+          done
+          exit 1
+      # cargo-packager notarizes only the .app, and without credentials only
+      # warns. Notarize and staple the .dmg as well (Gatekeeper checks the
+      # downloaded file first), then fail unless both pass Gatekeeper.
+      - name: Notarize the .dmg and check both
+        if: env.PACKAGE == 'true' && runner.os == 'macOS'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          dmg=$(ls dist/*.dmg)
+          xcrun notarytool submit "$dmg" --wait \
+            --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER"
+          for attempt in 1 2 3; do
+            xcrun stapler staple "$dmg" && break
+            [ $attempt = 3 ] && exit 1
+            sleep 60
+          done
+          codesign --verify --deep --strict --verbose=2 dist/Starfish.app
+          xcrun stapler validate dist/Starfish.app
+          xcrun stapler validate "$dmg"
+          spctl --assess --verbose=4 --type execute dist/Starfish.app
+          spctl --assess --verbose=4 --type open --context context:primary-signature "$dmg"
+      # The runner has Visual Studio, so a dependency on its C runtime would
+      # go unnoticed here and only fail on clean machines (.cargo/config.toml
+      # links it statically).
+      - name: Check the .exe needs no Visual C++ runtime
+        if: env.PACKAGE == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents target\release\starfish.exe | Out-String
+          Write-Output $deps
+          if ($deps -match '(?i)vcruntime|msvcp|api-ms-win-crt') {
+            throw "starfish.exe depends on the Visual C++ runtime"
+          }
+      - if: env.PACKAGE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: starfish-${{ matrix.name }}
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+            dist/*-setup.exe
+            dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      # A draft, so the notes can be written and the files checked before
+      # anyone sees it.
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: artifacts/*
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

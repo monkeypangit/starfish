@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug starfish",
+            "cargo": {
+                "args": ["build", "--bin=starfish", "--package=starfish"],
+                "filter": { "name": "starfish", "kind": "bin" }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Release starfish",
+            "cargo": {
+                "args": ["build", "--release", "--bin=starfish", "--package=starfish"],
+                "filter": { "name": "starfish", "kind": "bin" }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
