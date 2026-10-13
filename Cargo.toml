@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Raw photo editor with GPU neural demosaicing and denoising"
 
 [workspace]
-members = ["wgpu-run"]
+members = ["wgpu-run", "web"]
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }

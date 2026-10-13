@@ -1,0 +1,60 @@
+# Builds the web viewer (web/build.sh) and publishes it on GitHub Pages, on
+# every push to main that touches what goes into it, or by hand (Actions ->
+# Pages -> Run workflow). Needs Settings -> Pages -> Source: GitHub Actions.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - web/**
+      - wgpu-run/**
+      - training/*_wgpu/**
+      - Cargo.lock
+      - .cargo/config.toml
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# one deployment at a time; a newer push waits rather than cutting one short
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # wasm-bindgen-cli must be the version of the wasm-bindgen crate
+      - name: wasm-bindgen version
+        id: bindgen
+        run: echo "version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
+      - run: web/build.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

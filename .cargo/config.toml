@@ -6,3 +6,8 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# The web viewer (web/): rawler's uuid needs getrandom's browser backend,
+# which is picked by this cfg as well as the crate feature.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

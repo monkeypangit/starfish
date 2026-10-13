@@ -50,8 +50,12 @@ fn median(v: &mut [f64]) -> f64 {
     v[(v.len() - 1) / 2]
 }
 
-/// `f(i)` for every i in 0..n, in order, spread over the cores.
+/// `f(i)` for every i in 0..n, in order, spread over the cores. In one thread
+/// on wasm, which has no threads to spawn.
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    if cfg!(target_arch = "wasm32") {
+        return (0..n).map(f).collect();
+    }
     let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
     let chunk = n.div_ceil(threads).max(1);
     std::thread::scope(|scope| {

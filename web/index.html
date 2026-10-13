@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starfish Demosaic</title>
+<style>
+  :root {
+    --bg: #1c1c1f; --bar: #26262a; --text: #e8e8ea; --dim: #9a9aa2; --accent: #ffffff; --line: #3a3a40;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 16px;
+    background: var(--bar); border-bottom: 1px solid var(--line); }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  h1 span { color: var(--accent); }
+  button, label.button { font: inherit; color: var(--text); background: #34343a; border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+  button:hover, label.button:hover { background: #3e3e45; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .adjust { display: flex; align-items: center; gap: 8px; }
+  .adjust output { width: 4.5em; font-variant-numeric: tabular-nums; color: var(--dim); }
+  input[type=range] { accent-color: var(--accent); width: 160px; }
+  header a { color: var(--dim); }
+  header a:hover { color: var(--text); }
+  #status { flex: 1 1 240px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  main { position: relative; flex: 1; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  #hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 16px; color: var(--dim); pointer-events: none; }
+  #hint.error { color: #ff8a80; white-space: pre-line; }
+  main.drop::after { content: ""; position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>Starfish</span> demosaic</h1>
+  <label class="button">Open raw…<input id="file" type="file" hidden></label>
+  <div class="adjust">
+    <label for="ev">Exposure</label>
+    <input id="ev" type="range" min="-4" max="4" step="0.05" value="0">
+    <output id="ev-value">0.00 EV</output>
+  </div>
+  <div class="adjust">
+    <label for="sat">Saturation</label>
+    <input id="sat" type="range" min="100" max="200" step="1" value="130">
+    <output id="sat-value">130%</output>
+  </div>
+  <div class="adjust" title="As the desktop app's: 0% does not denoise, 50% uses the noise estimated from the file, 100% four times that">
+    <label for="nr">Noise reduction</label>
+    <input id="nr" type="range" min="0" max="100" step="1" value="0">
+    <output id="nr-value">0%</output>
+  </div>
+  <button id="fit" disabled>Fit</button>
+  <button id="actual" disabled>100%</button>
+  <button id="save" disabled>Save view</button>
+  <div id="status"></div>
+  <a href="https://github.com/monkeypangit/starfish" title="Source code and licences (MIT OR Apache-2.0; raw decoding by rawler, LGPL-2.1)">Source</a>
+</header>
+<main id="main">
+  <canvas id="canvas"></canvas>
+  <div id="hint">Open or drop a raw file (Bayer or Fujifilm X-Trans).<br>
+    It is demosaiced and denoised on your GPU; nothing is uploaded.</div>
+</main>
+<script type="module">
+import init, { Viewer } from "./starfish_web.js";
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("canvas"), hint = $("hint"), status = $("status"), ev = $("ev"), sat = $("sat"), nr = $("nr");
+// zoom and pan: canvas px per image px, and the image point at the canvas centre
+let scale = 1, cx = 0, cy = 0, fitted = true;
+let viewer, busy = false, dirty = true, name = "";
+// the opened file's model export and decode time, for developing it again
+let exp = null, decodeMs = 0;
+// the noise reduction the image was last developed with
+let developedNoise = null;
+// ?nodraw: never present to the canvas (headless Chromium loses the device
+// when it does); the view is still there through snapshot / Save view
+const nodraw = new URLSearchParams(location.search).has("nodraw");
+
+function say(text, error = false) {
+  hint.textContent = text;
+  hint.classList.toggle("error", error);
+  hint.hidden = !text;
+}
+
+function fit() {
+  const w = viewer.width(), h = viewer.height();
+  if (!w) return;
+  scale = Math.min(canvas.width / w, canvas.height / h);
+  cx = w / 2; cy = h / 2; fitted = true; dirty = true;
+}
+
+function frame() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (w !== canvas.width || h !== canvas.height) {
+    canvas.width = w; canvas.height = h;
+    viewer.resize(w, h);
+    if (fitted) fit();
+    dirty = true;
+  }
+  if (dirty && !nodraw) {
+    dirty = false;
+    try { viewer.draw(scale, cx, cy, Number(ev.value), sat.value / 100); } catch (e) { console.error(e); }
+  }
+  requestAnimationFrame(frame);
+}
+
+async function fetchModel(exp) {
+  const base = `models/${exp}/`;
+  const list = await fetch(base + "files.txt");
+  if (!list.ok) throw new Error(`Could not fetch ${base}files.txt`);
+  const names = (await list.text()).split("\n").filter(Boolean);
+  const files = await Promise.all(names.map(async (n) => {
+    const r = await fetch(base + n);
+    if (!r.ok) throw new Error(`Could not fetch ${base}${n}`);
+    return new Uint8Array(await r.arrayBuffer());
+  }));
+  viewer.add_model(exp, names, files);
+}
+
+// lets the "Developing…" text paint before the main thread is busy
+const paint = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+
+// Runs the network on the opened file with the noise reduction slider's
+// value and waits for the GPU; updates the status line.
+async function develop() {
+  const t = performance.now();
+  developedNoise = nr.value;
+  const line = viewer.develop(exp, nr.value / 100);
+  while (!viewer.developed()) await new Promise((r) => requestAnimationFrame(r));
+  const error = viewer.take_error();
+  if (error) throw new Error(error);
+  dirty = true;
+  status.textContent = `${name} · ${viewer.camera()} · ${viewer.width()}×${viewer.height()} · ${exp} on ${viewer.gpu()} · ` +
+    `decode ${decodeMs} ms, develop ${Math.round(performance.now() - t)} ms (${line})`;
+  status.title = status.textContent;
+  console.log("developed:", status.textContent);
+}
+
+async function open(file, bytes) {
+  if (busy) return;
+  busy = true;
+  name = file;
+  exp = null;
+  try {
+    say(`Decoding ${name}…`); status.textContent = "";
+    await paint();
+    const t0 = performance.now();
+    const model = viewer.open(bytes);
+    decodeMs = Math.round(performance.now() - t0);
+    if (!viewer.has_model(model)) {
+      say(`Loading the ${model} model…`);
+      await fetchModel(model);
+    }
+    exp = model;
+    say(`Developing ${name}…`);
+    await paint();
+    await develop();
+    say("");
+    fit();
+    $("fit").disabled = $("actual").disabled = $("save").disabled = false;
+  } catch (e) {
+    say(String(e.message ?? e), true);
+    console.error("failed:", e);
+  } finally {
+    busy = false;
+  }
+  redevelop();
+}
+
+// Develops the open file again until it matches the noise reduction slider:
+// one run at a time, the next with the latest value, as the app does.
+async function redevelop() {
+  if (busy || !exp || developedNoise === nr.value) return;
+  busy = true;
+  try {
+    while (developedNoise !== nr.value) {
+      status.textContent = `Updating ${name}…`;
+      await paint();
+      await develop();
+    }
+  } catch (e) {
+    say(String(e.message ?? e), true);
+    console.error("failed:", e);
+  } finally {
+    busy = false;
+  }
+}
+
+// the view as a PNG (pixels as RGBA8 from the GPU)
+async function png(w, h) {
+  const pixels = await viewer.snapshot(w, h, scale, cx, cy, Number(ev.value), sat.value / 100);
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer), w, h), 0, 0);
+  return new Promise((r) => c.toBlob(r, "image/png"));
+}
+
+async function save() {
+  const blob = await png(canvas.width, canvas.height);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name.replace(/\.[^.]*$/, "") + ".png";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+async function openFile(file) {
+  open(file.name, new Uint8Array(await file.arrayBuffer()));
+}
+
+// why navigator.gpu is missing, as far as the page can tell
+function noWebGpu() {
+  if (!window.isSecureContext) {
+    return "WebGPU only works on secure pages: open this one over HTTPS, or from localhost.";
+  }
+  if (navigator.userAgent.includes("Firefox/")) {
+    return "WebGPU is turned off in this Firefox.\n" +
+      "Open about:config, set dom.webgpu.enabled to true and restart Firefox, or use Chrome or Edge.";
+  }
+  return "This browser has no WebGPU. Try a recent Chrome, Edge or Safari.";
+}
+
+async function main() {
+  if (!navigator.gpu) {
+    say(noWebGpu(), true);
+    return;
+  }
+  await init();
+  try {
+    viewer = await Viewer.create(canvas);
+  } catch (e) {
+    const message = String(e.message ?? e);
+    say(message.startsWith("No WebGPU adapter")
+      ? "WebGPU is on, but this browser found no GPU it can use.\n" +
+        "Check that the graphics driver works; after a driver update, restart the computer.\n\n" + message
+      : message, true);
+    return;
+  }
+  requestAnimationFrame(frame);
+
+  $("file").addEventListener("change", (e) => e.target.files[0] && openFile(e.target.files[0]));
+  ev.addEventListener("input", () => {
+    $("ev-value").value = `${Number(ev.value) >= 0 ? "+" : ""}${Number(ev.value).toFixed(2)} EV`;
+    dirty = true;
+  });
+  ev.addEventListener("dblclick", () => { ev.value = 0; ev.dispatchEvent(new Event("input")); });
+  sat.addEventListener("input", () => { $("sat-value").value = `${sat.value}%`; dirty = true; });
+  sat.addEventListener("dblclick", () => { sat.value = 130; sat.dispatchEvent(new Event("input")); });
+  // 0% at first, as the desktop app starts a file
+  nr.addEventListener("input", () => { $("nr-value").value = `${nr.value}%`; redevelop(); });
+  nr.addEventListener("dblclick", () => { nr.value = 0; nr.dispatchEvent(new Event("input")); });
+  $("fit").addEventListener("click", fit);
+  $("save").addEventListener("click", save);
+  $("actual").addEventListener("click", () => { scale = 1; fitted = false; dirty = true; });
+
+  // drag to pan, wheel to zoom about the pointer, double click: fit / 100%
+  const toImage = (e) => {
+    const dpr = window.devicePixelRatio || 1, r = canvas.getBoundingClientRect();
+    return [(e.clientX - r.left) * dpr - canvas.width / 2, (e.clientY - r.top) * dpr - canvas.height / 2];
+  };
+  let drag = null;
+  canvas.addEventListener("pointerdown", (e) => {
+    drag = toImage(e); canvas.setPointerCapture(e.pointerId); canvas.classList.add("dragging");
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const p = toImage(e);
+    cx -= (p[0] - drag[0]) / scale; cy -= (p[1] - drag[1]) / scale;
+    drag = p; fitted = false; dirty = true;
+  });
+  const release = () => { drag = null; canvas.classList.remove("dragging"); };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
+  const zoomAt = (e, factor) => {
+    const [px, py] = toImage(e);
+    const next = Math.min(32, Math.max(0.01, scale * factor));
+    cx += px / scale - px / next; cy += py / scale - py / next;
+    scale = next; fitted = false; dirty = true;
+  };
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    zoomAt(e, Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.002)));
+  }, { passive: false });
+  canvas.addEventListener("dblclick", (e) => {
+    if (!viewer.width()) return;
+    if (fitted || scale < 1) zoomAt(e, 1 / scale); else fit();
+  });
+
+  const main = $("main");
+  main.addEventListener("dragover", (e) => { e.preventDefault(); main.classList.add("drop"); });
+  main.addEventListener("dragleave", () => main.classList.remove("drop"));
+  main.addEventListener("drop", (e) => {
+    e.preventDefault(); main.classList.remove("drop");
+    if (e.dataTransfer.files[0]) openFile(e.dataTransfer.files[0]);
+  });
+
+  // for tests: the view as a base64 PNG
+  window.starfish = {
+    png: async () => {
+      const bytes = new Uint8Array(await (await png(canvas.width, canvas.height)).arrayBuffer());
+      let text = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      return btoa(text);
+    },
+  };
+
+  // ?raw=<url> opens a file from the server, for testing
+  const url = new URLSearchParams(location.search).get("raw");
+  if (url) {
+    const r = await fetch(url);
+    if (r.ok) open(url.split("/").pop(), new Uint8Array(await r.arrayBuffer()));
+    else say(`Could not fetch ${url}`, true);
+  }
+}
+main();
+</script>
+</body>
+</html>

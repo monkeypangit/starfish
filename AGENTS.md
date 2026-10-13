@@ -30,11 +30,14 @@ resources/      fonts (+ licences), icon/ (placeholder five-blade iris logo:
     lens.rs     LensPass: distortion + CA + vignetting resample (shaders/lens.wgsl);
                 the app asks it for CA only (distortion and vignetting are drawn)
 build.rs        embeds training/*_wgpu/{f16,f32}/ into release builds
+web/            workspace crate starfish-web: the models in the browser (wasm32 + WebGPU),
+                one raw file, zoom/pan/exposure; build.sh -> web/dist/ (gitignored)
 wgpu-run/       workspace crate demosaic-run: the model-agnostic wgpu executor
   src/lib.rs      Model::load(dir) / load_with(read), model.run(mosaic, sigma, h, w) on the
                   CPU, model.run_texture(mosaic, sigma, output) all on the GPU,
                   model.run_raw(RawInput, output) the same from the raw frame (the app's)
   src/noise.rs    estimate_noise (sigma^2 = a*x + b fit) and inputs() (balanced mosaic + sigma)
+  src/pad.rs      the CFA phase and the mirror padding onto the model (app and web/ share it)
   src/main.rs     demosaic-run: test/benchmark tool (test.bin, --raw, --bench)
   src/raw.rs      raw decoding for demosaic-run only
 training/       PyTorch joint demosaic + denoise for X-Trans and Bayer
@@ -356,6 +359,53 @@ own header), sub-IFD 0xf000, `SRATIONAL` arrays laid out `[scale, knots.., value
   from `LensPass`, to compare with the JPEG; its `STARFISH_TEST_EXPORT` is
   developed as the app does it (CA in `LensPass`, the rest drawn). Compare
   16-bit PNGs with something that reads 16 bits: Pillow reads 16-bit RGB as 8.
+
+## The web viewer (web/)
+
+A static page that runs the neural demosaic on the visitor's GPU: open or drop
+one raw file, see the network's output (camera matrix, exposure, clip, sRGB;
+no other develop step), exposure and saturation sliders (100-200%, starting at
+the app's default 130%), a noise reduction slider as the app's (0-100%,
+`noise_factor` `(9^s - 1) / 2` on the fitted sigma, 0% at first; each change
+runs the network again, one run at a time, the next with the latest value,
+reusing the frame and noise fit `Viewer` keeps per file), zoom (wheel, double
+click), pan (drag), "Save view" as PNG. Nothing is uploaded. Not iced:
+`index.html` does the I/O and input, `src/lib.rs` (`Viewer`, wasm-bindgen) the
+decode, noise fit and GPU work through the same `Model::run_raw` as the app,
+into mip 0 of a mipmapped `Rgba16Float` texture (`run_windows` binds only
+level 0 for that), whose other levels `mip.wgsl` fills; `show.wgsl` draws it
+(flat pixels zoomed in, trilinear mips zoomed out). `src/raw.rs` is the app's
+`raw::decode` from bytes, without metadata, WB slider or lens profile.
+
+- Build: `web/build.sh` (wasm32-unknown-unknown target, wasm-bindgen-cli at
+  Cargo.lock's wasm-bindgen version, in `~/.cargo/bin`), then serve `web/dist/`,
+  e.g. `python3 -m http.server -d web/dist`. The page fetches only the export
+  the file needs (`models/<export>/files.txt` lists its files): f16 where the
+  adapter has `shader-f16` (Chrome), else f32. The wasm is ~7 MB.
+- Published on GitHub Pages by `.github/workflows/pages.yml` (pushes to main
+  that touch web/, wgpu-run/, the exports, Cargo.lock or .cargo/config.toml,
+  or by hand): stable Rust + wasm32 target, wasm-bindgen-cli at Cargo.lock's
+  version (taiki-e/install-action), `web/build.sh`, deploy `web/dist/`. Needs
+  Settings -> Pages -> Source: GitHub Actions. The header links the repo
+  (source and licences: rawler is LGPL-2.1 and compiled into the wasm).
+- On wasm the crate's whole source is `cfg(target_arch = "wasm32")`, so the
+  native workspace build and CI pass over it. rawler's uuid needs
+  getrandom's browser backend: crate features plus the
+  `getrandom_backend="wasm_js"` cfg in `.cargo/config.toml`.
+- What differs on wasm: no threads (`noise::par_map` runs in one; rawler's
+  rayon falls back by itself), and `device.poll` returns at once, so
+  `run_raw` queues every window without waiting; `develop` returns after
+  queuing and `on_submitted_work_done` sets the flag the page polls
+  (`developed`). rawler decodes bitwise as natively (RAF, NEF, RW2 checked
+  under WASI, 1-1.7x slower), but **CR3 cannot work**: rawler's CR3 decoder
+  calls `Instant::now()`, which panics on wasm32-unknown-unknown.
+- Testing headlessly: Chromium's SwiftShader adapter
+  (`--headless=new --enable-unsafe-webgpu --use-webgpu-adapter=swiftshader
+  --enable-unsafe-swiftshader`) runs it, but loses the device on the first
+  canvas present (any WebGPU page, every flag tried). So `?nodraw` never
+  presents, `?raw=<url>` opens a file from the server, and
+  `window.starfish.png()` returns the view (`Viewer::snapshot`, the same
+  render into an offscreen texture) as base64 PNG, over the DevTools protocol.
 
 ## Publishing
 

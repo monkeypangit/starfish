@@ -40,6 +40,7 @@ use std::sync::OnceLock;
 use wgpu::util::DeviceExt as _;
 
 pub mod noise;
+pub mod pad;
 
 pub struct Model {
     device: wgpu::Device,
@@ -530,7 +531,12 @@ impl Model {
                 usage: wgpu::BufferUsages::UNIFORM,
             });
 
-        let output = output.create_view(&Default::default());
+        // level 0 only: a storage binding is one mip level, and the caller
+        // may want to fill the rest from it (the web viewer does)
+        let output = output.create_view(&wgpu::TextureViewDescriptor {
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
         let bind = |pipeline: &wgpu::ComputePipeline, i: usize, rest: &[wgpu::BindingResource]| {
             let param = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: &uniform,
