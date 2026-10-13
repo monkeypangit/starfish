@@ -45,6 +45,10 @@ Installers are currently generated automatically by GitHub. The Windows builds a
 | macOS | `starfish_<version>_aarch64.dmg` (Apple Silicon only) | Drag Starfish to Applications. The first time you open it, macOS asks whether to open an app downloaded from the internet: click **Open**. |
 | Linux | `starfish_<version>_amd64.deb` or `starfish_<version>_x86_64.AppImage` | `.deb`: `sudo apt install ./starfish_<version>_amd64.deb`. AppImage: `chmod +x` it and run it. Both need Vulkan drivers. |
 
+## Known issues
+- The neural demosaic is not perfect. There is luma zippering in overexposed saturated areas. The X-Trans model is prone to zippering along sharp edges. The Bayer model struggles with moiré patterns.
+- Dragging and dropping files into the editor and library should work on Windows and macOS. However on Linux under Wayland this is not implemented yet.
+
 ## Future improvements
 The most important issue is to push up performance and output quality of the neural demosaicing. The Bayer output is currently looking quite good. Some moire remains but otherwise ok. X-Trans model shows luma zippering along edges. I am uncertain exactly why this happens but adding more layers to the full resolution head of the model and/or increasing the number of channels into the head layers help but makes the model slower.
 
@@ -101,10 +105,6 @@ Ultimately it is hard to say what is the best setup. These things are still unde
 
 ## Other dependencies
 Raw files are decoded with [rawler](https://github.com/dnglab/dnglab). Without it and the many other dependencies this project would not have been possible. Please inspect the rust manifest file in the project root folder for details.
-
-## Known issues
-- The neural demosaic is not perfect. There is luma zippering in overexposed saturated areas. The X-Trans model is prone to zippering along sharp edges. The Bayer model struggles with moiré patterns.
-- Dragging and dropping files into the editor and library should work on Windows and macOS. However on Linux under Wayland this is not implemented yet.
 
 ## Training models
 
