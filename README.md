@@ -5,12 +5,13 @@
 ![Starfish editing a raw photo](resources/screenshot.jpg)
 
 ## Purpose
-This project has a few expressed purposes:
+This project is intended to:
 
-* To function as a basic raw editor
-* To illustrate the output quality of a basic neural joint demosaicing and denoising model
-* To illustrate the viability of using wgpu as a distribution platform for neurual models in raw photo editors
-* To server as a test bench for future demosaicing techniques
+* Function as a basic raw editor
+* Show the output quality of a basic neural joint demosaicing and denoising model
+* Illustrate the viability of using wgpu as a distribution platform for neurual models in raw photo editors
+* Be a test bench for future demosaicing techniques
+* Act as a way to connect with others interested in the topic
 
 Ultimately the idea is to develop a solid pipeline for joint demosaicing + denoising + chromatic aberration correction that can be integrated into other projects. This would avoid the need to maintain this application as a separate project.
 
