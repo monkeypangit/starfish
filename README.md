@@ -4,6 +4,9 @@
 
 ![Starfish editing a raw photo](resources/screenshot.jpg)
 
+## Demosaic module in browser
+[Try the demosaicing and denoising module directly in your browser (if it supports WebGPU)](https://monkeypangit.github.io/starfish/)
+
 ## Purpose
 This project is intended to:
 
