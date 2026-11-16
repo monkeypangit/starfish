@@ -1,9 +1,9 @@
 //! Fitting a raw frame to a network: the CFA phase, and the padding.
 //!
 //! Each network is built for one CFA phase (`Model::cfa`) and sizes that are a
-//! multiple of its period, and pads circularly. So the frame is padded: on
-//! every side by at least the network's reach (`Model::halo`), so no frame
-//! pixel sees the opposite edge, and by up to one period more to land on the
+//! multiple of its period, and pads with zeros (circularly, before 2026-10-18).
+//! So the frame is padded: on every side by at least the network's reach
+//! (`Model::halo`), so no frame pixel sees the padding or the opposite edge, and by up to one period more to land on the
 //! model's phase and a whole number of periods. The padding mirrors the frame
 //! across its edges in whole periods, which keeps every padded site's CFA
 //! colour right. `Padding::source` is what `RawInput::rows` / `cols` take.

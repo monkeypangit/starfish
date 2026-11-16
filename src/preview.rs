@@ -13,14 +13,14 @@ use iced::advanced::graphics::Viewport;
 use iced::widget::shader::{self, Action};
 use iced::{Event, Point, Rectangle, Size, Vector, mouse};
 
-use crate::agx;
+use crate::color_edit::{ColorMix, Grading};
 use crate::develop::{self, EditUniform, LensUniform};
 use crate::lens::{Corrections, LUT_RHO_MAX, LUT_SIZE};
 use crate::local::LocalContrast;
 use crate::processing::Image;
 use crate::raw::WhiteBalance;
 use crate::source::{GridUniform, Source};
-use crate::wheel;
+use crate::tone;
 
 /// Extra stops of detail per stop at the local contrast slider's maximum.
 pub const LOCAL_GAIN: f32 = 0.7;
@@ -29,12 +29,26 @@ pub const LOCAL_GAIN: f32 = 0.7;
 const PREVIEW_SHADER: &str = include_str!("shaders/preview.wgsl");
 pub const MIN_SCALE: f32 = 0.01;
 pub const MAX_SCALE: f32 = 32.0;
-const ZOOM_STEP: f32 = 1.25;
+/// Space left at each edge of the fitted image: the side panels' padding
+/// (`SPACING_LARGE` in main.rs).
+const FIT_MARGIN: f32 = 20.0;
+/// How far the pane dividers' grab area (main.rs's `PANE_RESIZE_LEEWAY` plus
+/// the 1 px gap) reaches into the preview, in logical pixels.
+const DIVIDER_GRAB: f32 = 8.0;
+/// Zoom per mouse-wheel notch.
+const WHEEL_ZOOM_STEP: f32 = 1.2;
 /// Linear 18% grey.
 pub const MID_GRAY: f32 = 0.18;
-pub const DEFAULT_SATURATION: f32 = 1.30;
+/// 100%: the camera matrix's colour. Matching the embedded JPEGs' chroma
+/// (61 test raws, 2026-11-14) gives a median of 0.93 (Nikon 0.81 … Fuji,
+/// Panasonic 1.03); 1.5 was right while the matrix was the identity.
+pub const DEFAULT_SATURATION: f32 = 1.0;
+/// Vibrance: the extra saturation gain of a grey pixel at amount 1 (see
+/// `Adjustments::vibrance`), and the chroma where it has fallen to half.
+pub const VIBRANCE_RANGE: f32 = 0.055;
+pub const DEFAULT_GRAIN: f32 = 1.0;
 
-/// User adjustments applied at display time, through AgX (see `agx`).
+/// User adjustments applied at display time, through the tone curve (see `tone`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Adjustments {
     /// Warm (+) / cool (−) shift, −1 … +1, of the as-shot colour
@@ -43,26 +57,47 @@ pub struct Adjustments {
     /// Magenta (+) / green (−) shift, −1 … +1: the green gain.
     pub tint: f32,
     /// Linear value subtracted before exposure, as a fraction of
-    /// [`agx::WHITE`], −0.05 … +0.05: positive removes haze and flare,
+    /// [`tone::WHITE`], −0.05 … +0.05: positive removes haze and flare,
     /// negative lifts black. 0 = unchanged.
     pub black_point: f32,
     /// Stops, −5 … +5, applied to the linear image.
     pub exposure: f32,
-    /// Slope of the tone curve where it crosses the diagonal; 1 = no curve.
+    /// Highlight strength, 1 = no curve: the slope of the tone curve where it
+    /// crosses the diagonal when the midpoint is mid grey, and for any other
+    /// midpoint the slope that renders the highlights the same
+    /// (`tone::Curve::new`).
     pub contrast: f32,
     /// Linear value (after exposure) where the tone curve crosses the
     /// diagonal; it stays put while contrast swings the rest about it.
     pub midpoint: f32,
     /// Applied after the sigmoid. 0 = greyscale, 1 = unchanged, 2 = double.
     pub saturation: f32,
-    /// Colour wheel pucks for the shadows, midtones and highlights: right,
-    /// down, in the unit disc (see `wheel`). 0, 0 = no tint.
-    pub grading: [[f32; 2]; 3],
-    /// Brightness of the shadows, midtones and highlights, −1 … +1, applied
-    /// last, after the tone curve and grading. 0 = unchanged.
-    pub levels: [f32; 3],
+    /// Extra saturation for the less colourful pixels, 0 … 2 (0 = none): the
+    /// pixel's colour (its distance from the grey of its luma) is scaled by
+    /// `saturation * (1 + vibrance / (1 + (chroma / VIBRANCE_RANGE)^2))`, so a
+    /// grey-ish pixel gets the whole of it and a vivid one hardly any. No
+    /// skin-tone protection.
+    pub vibrance: f32,
+    /// The colour mixer and the colour grading (see `color_edit`).
+    pub color_mix: ColorMix,
+    pub grading: Grading,
     /// Contrast of detail against its surroundings, 0 … 1. 0 = unchanged.
     pub local_contrast: f32,
+    /// Sharpening of the finest detail, 0 … 1 (`develop.wgsl`'s `sharpen`):
+    /// strength and radius grow together. 0 = unchanged.
+    pub sharpness: f32,
+    /// Sharpness of the tone curve's knees (`tone::POWER` = default).
+    pub toe_power: f32,
+    pub shoulder_power: f32,
+    /// How much of the noise the network removed is put back as grain where
+    /// the image is drawn (`develop.wgsl`), 0 … 1: 0 = the denoised image,
+    /// 1 = all of it back.
+    pub grain: f32,
+    /// Artificial grain added to the image, 0 … 1 (`develop.wgsl`'s
+    /// `add_grain`): Gaussian noise in linear light whose spread follows a
+    /// shot + read noise model, so it is stronger in bright areas but
+    /// stands out most in the shadows after the tone curve. 0 = none.
+    pub added_grain: f32,
 }
 
 impl Default for Adjustments {
@@ -72,18 +107,21 @@ impl Default for Adjustments {
             tint: 0.0,
             black_point: 0.0,
             exposure: 0.0,
-            contrast: agx::DEFAULT_CONTRAST,
+            contrast: tone::DEFAULT_CONTRAST,
             midpoint: MID_GRAY,
             saturation: DEFAULT_SATURATION,
-            grading: [[0.0; 2]; 3],
-            levels: [0.0; 3],
-            local_contrast: 0.0,
+            vibrance: 0.0,
+            color_mix: ColorMix::default(),
+            grading: Grading::default(),
+            local_contrast: 0.2,
+            sharpness: 0.2,
+            toe_power: tone::POWER,
+            shoulder_power: tone::POWER,
+            grain: DEFAULT_GRAIN,
+            added_grain: 0.0,
         }
     }
 }
-
-/// Display-encoded offset of a fully pushed wheel, at its strongest channel.
-const GRADE_STRENGTH: f32 = 0.2;
 
 /// Stops of gain at a slider end.
 const WB_STOPS: f32 = 0.5;
@@ -102,19 +140,6 @@ impl Adjustments {
             ],
         };
         [r, (-self.tint * WB_STOPS).exp2(), b]
-    }
-
-    /// Display-encoded RGB offsets for the three wheels, w unused: the
-    /// wheel's hue with its brightness removed, scaled by the square of
-    /// its distance from the centre so small moves near the middle are gentle.
-    pub fn grade_tints(&self) -> [[f32; 4]; 3] {
-        self.grading.map(|position| {
-            let (angle, strength) = wheel::polar(position);
-            let rgb = wheel::hue_rgb(angle);
-            let mean = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
-            let [r, g, b] = rgb.map(|c| (c - mean) * strength * strength * GRADE_STRENGTH);
-            [r, g, b, 0.0]
-        })
     }
 
     /// `cam_to_srgb` with the gains folded in: M · diag(gains).
@@ -150,8 +175,12 @@ impl Default for ViewState {
 }
 
 impl ViewState {
+    /// The scale that fits the image, leaving `FIT_MARGIN` free on every side
+    /// (as the side panels pad their content).
     pub fn fit_scale(pane: Size, image: Size) -> f32 {
-        (pane.width / image.width).min(pane.height / image.height)
+        let width = (pane.width - 2.0 * FIT_MARGIN).max(1.0);
+        let height = (pane.height - 2.0 * FIT_MARGIN).max(1.0);
+        (width / image.width).min(height / image.height)
     }
 
     /// Concrete (scale, center) for the given pane and image size.
@@ -175,11 +204,28 @@ impl ViewState {
             zoom: Zoom::Scale(new_scale),
             center: under_cursor - anchor * (1.0 / new_scale),
         }
+        .kept_on(image)
     }
 
-    pub fn zoom_step(&self, zoom_in: bool, pane: Size, image: Size) -> Self {
-        let factor = if zoom_in { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
-        self.zoom_by(factor, Vector::ZERO, pane, image)
+    /// The view with its centre moved back into the image, so the image
+    /// always covers the pane's centre and never leaves the view entirely.
+    fn kept_on(mut self, image: Size) -> Self {
+        self.center = Point::new(
+            self.center.x.clamp(0.0, image.width),
+            self.center.y.clamp(0.0, image.height),
+        );
+        self
+    }
+
+    /// A click toggles fit <-> 100%, zooming on the point under `anchor`
+    /// (offset from the pane centre).
+    pub fn toggle_zoom(&self, anchor: Vector, pane: Size, image: Size) -> Self {
+        if self.zoom == Zoom::Fit {
+            let (scale, _) = self.resolve(pane, image);
+            self.zoom_by(1.0 / scale, anchor, pane, image)
+        } else {
+            Self::default()
+        }
     }
 
     /// Pans by a screen-space delta in logical pixels.
@@ -189,6 +235,7 @@ impl ViewState {
             zoom: Zoom::Scale(scale),
             center: center - delta * (1.0 / scale),
         }
+        .kept_on(image)
     }
 
     /// The same view after turning the shown image (of size `image`, already
@@ -197,13 +244,6 @@ impl ViewState {
         Self {
             zoom: self.zoom,
             center: turn.apply(self.center, image),
-        }
-    }
-
-    pub fn actual_size(image: Size) -> Self {
-        Self {
-            zoom: Zoom::Scale(1.0),
-            center: Point::new(image.width / 2.0, image.height / 2.0),
         }
     }
 }
@@ -216,6 +256,18 @@ pub struct Rotation(u8);
 impl Rotation {
     pub const CLOCKWISE: Self = Self(1);
     pub const COUNTER_CLOCKWISE: Self = Self(3);
+
+    /// The turn that makes an image upright for an EXIF orientation: 3 is a
+    /// half turn, 6 a clockwise and 8 a counter-clockwise quarter. The
+    /// mirrored ones (2, 4, 5, 7) cannot be expressed and stay as they are.
+    pub fn from_exif(orientation: u16) -> Self {
+        match orientation {
+            3 => Self(2),
+            6 => Self::CLOCKWISE,
+            8 => Self::COUNTER_CLOCKWISE,
+            _ => Self::default(),
+        }
+    }
 
     /// This rotation followed by `turn`.
     pub fn then(self, turn: Self) -> Self {
@@ -273,8 +325,9 @@ const FRAME_MARGIN: f32 = 0.07;
 /// At least this much room (logical pixels) around the frame, so the crop
 /// bar fits under it.
 const MIN_FRAME_MARGIN: f32 = 76.0;
-/// Corner radius of the frame in crop mode, as a fraction of its short side.
-pub const FRAME_CORNER: f32 = 0.025;
+/// Corner radius of the frame in crop mode, as a fraction of its short side
+/// (0 = square).
+pub const FRAME_CORNER: f32 = 0.0;
 
 /// The export frame: a window on the (quarter-turned) image with the image's
 /// aspect, free to move, zoom and tilt against the image. The result of the
@@ -422,6 +475,39 @@ impl Crop {
         }
     }
 
+    /// The largest frame of this shape and tilt that lies wholly inside a
+    /// rotated image of size `image`, as near the current position as it can
+    /// be: the zoom is the smallest that fits (at the image's centre), then
+    /// the offset is pulled back inside what that leaves.
+    #[cfg(test)]
+    pub fn inscribed(&self, image: Size) -> Self {
+        Self { zoom: MIN_CROP_ZOOM, ..*self }.within(image)
+    }
+
+    /// The same crop with the frame kept wholly inside a rotated image of
+    /// size `image`: zoomed in only as far as it takes to fit, and moved only
+    /// as far as it takes. A crop already inside is unchanged.
+    pub fn within(&self, image: Size) -> Self {
+        let unit = Self { zoom: 1.0, ..*self }.frame_size(image);
+        let (sin, cos) = (self.angle.sin().abs(), self.angle.cos().abs());
+        let fits = ((unit.width * cos + unit.height * sin) / image.width)
+            .max((unit.width * sin + unit.height * cos) / image.height);
+        let zoom = self.zoom.max(fits).clamp(MIN_CROP_ZOOM, MAX_CROP_ZOOM);
+        let frame = Size::new(unit.width / zoom, unit.height / zoom);
+        let room = Vector::new(
+            ((image.width - (frame.width * cos + frame.height * sin)) / 2.0).max(0.0),
+            ((image.height - (frame.width * sin + frame.height * cos)) / 2.0).max(0.0),
+        );
+        Self {
+            offset: Vector::new(
+                self.offset.x.clamp(-room.x, room.x),
+                self.offset.y.clamp(-room.y, room.y),
+            ),
+            zoom,
+            ..*self
+        }
+    }
+
     /// The same crop after turning the image by `turn`.
     pub fn rotated(&self, turn: Rotation) -> Self {
         Self {
@@ -435,11 +521,17 @@ impl Crop {
 /// height) centred in the pane, leaving a margin.
 pub fn frame_rect(pane: Size, aspect: f32) -> Rectangle {
     let margin = (pane.width.min(pane.height) * FRAME_MARGIN).max(MIN_FRAME_MARGIN);
-    let (w, h) = ((pane.width - 2.0 * margin).max(1.0), (pane.height - 2.0 * margin).max(1.0));
+    let (w, h) = (
+        (pane.width - 2.0 * margin).max(1.0),
+        (pane.height - 2.0 * margin).max(1.0),
+    );
     let width = w.min(h * aspect);
     let size = Size::new(width, width / aspect);
     Rectangle::new(
-        Point::new((pane.width - size.width) / 2.0, (pane.height - size.height) / 2.0),
+        Point::new(
+            (pane.width - size.width) / 2.0,
+            (pane.height - size.height) / 2.0,
+        ),
         size,
     )
 }
@@ -458,6 +550,12 @@ pub enum Interaction {
     /// Turn clockwise about the pane's centre, in radians (right drag, or a
     /// horizontal drag above or below the frame).
     Rotate(f32),
+    /// A click (a press and release without a drag) at a point in the pane,
+    /// while picking pixels.
+    Click(Point),
+    /// A click outside picking and crop mode: toggle fit / 200% at an
+    /// anchor offset from the pane centre.
+    ToggleZoom(Vector),
 }
 
 /// The `shader::Program` for the preview pane.
@@ -472,6 +570,15 @@ pub struct Preview<'a, Message> {
     pub cropping: bool,
     /// The distortion and vignetting corrections to draw with.
     pub lens: Corrections,
+    /// Picking pixels: a click is reported, and the cursor is a crosshair.
+    pub picking: bool,
+    /// Overlay: clipped highlights drawn black, clipped shadows white.
+    pub clip_highlights: bool,
+    pub clip_shadows: bool,
+    /// Overlay: pixels near the tone curve's crossover drawn purple.
+    pub crossover: bool,
+    /// Overlay: a rule-of-thirds grid over the frame.
+    pub grid: bool,
     pub on_interaction: fn(Interaction) -> Message,
 }
 
@@ -491,6 +598,8 @@ enum Drag {
 /// Logical pixels of dragging per factor `e` of zoom, and per radian of tilt.
 const ZOOM_DRAG: f32 = 200.0;
 const ROTATE_DRAG: f32 = 600.0;
+/// A press and release this close (logical px travelled) is a click, not a drag.
+const CLICK_TRAVEL: f32 = 4.0;
 
 #[derive(Default)]
 pub struct State {
@@ -498,6 +607,8 @@ pub struct State {
     drag_from: Option<Point>,
     drag: Drag,
     rotate_from: Option<Point>,
+    /// How far the cursor has moved since the left button went down, px.
+    travel: f32,
 }
 
 impl<Message> Preview<'_, Message> {
@@ -506,17 +617,25 @@ impl<Message> Preview<'_, Message> {
         let Some(image) = self.image else {
             return Drag::Pan;
         };
-        let rotated = self.rotation.size(Size::new(image.width as f32, image.height as f32));
+        let rotated = self
+            .rotation
+            .size(Size::new(image.width as f32, image.height as f32));
         let frame = frame_rect(pane, self.crop.frame_aspect(rotated));
         // How far outside the frame along each axis.
-        let over_x = (frame.x - position.x).max(position.x - (frame.x + frame.width)).max(0.0);
-        let over_y = (frame.y - position.y).max(position.y - (frame.y + frame.height)).max(0.0);
+        let over_x = (frame.x - position.x)
+            .max(position.x - (frame.x + frame.width))
+            .max(0.0);
+        let over_y = (frame.y - position.y)
+            .max(position.y - (frame.y + frame.height))
+            .max(0.0);
         if over_x == 0.0 && over_y == 0.0 {
             Drag::Pan
         } else if over_x >= over_y {
             Drag::Zoom
         } else {
-            Drag::Rotate { above: position.y < frame.y }
+            Drag::Rotate {
+                above: position.y < frame.y,
+            }
         }
     }
 }
@@ -551,12 +670,19 @@ impl<Message> shader::Program<Message> for Preview<'_, Message> {
                 };
                 let anchor = position - Point::new(bounds.width / 2.0, bounds.height / 2.0);
                 publish(Interaction::Zoom {
-                    factor: ZOOM_STEP.powf(lines),
+                    factor: WHEEL_ZOOM_STEP.powf(lines),
                     anchor,
                 })
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // The pane dividers' grab area reaches into the preview: a
+                // press there resizes the panes, it must not pan the image.
+                let position = cursor.position_in(bounds)?;
+                if position.x < DIVIDER_GRAB || position.x > bounds.width - DIVIDER_GRAB {
+                    return None;
+                }
                 state.drag_from = Some(cursor.position_over(bounds)?);
+                state.travel = 0.0;
                 state.drag = match cursor.position_in(bounds) {
                     Some(position) if self.cropping => self.drag_at(position, bounds.size()),
                     _ => Drag::Pan,
@@ -581,6 +707,7 @@ impl<Message> shader::Program<Message> for Preview<'_, Message> {
                 let from = state.drag_from?;
                 state.drag_from = Some(*position);
                 let delta = *position - from;
+                state.travel += delta.x.abs() + delta.y.abs();
                 publish(match state.drag {
                     Drag::Pan => Interaction::Pan(delta),
                     Drag::Zoom => Interaction::Zoom {
@@ -594,7 +721,19 @@ impl<Message> shader::Program<Message> for Preview<'_, Message> {
                 })
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                state.drag_from.take().map(|_| Action::capture())
+                state.drag_from.take()?;
+                match cursor.position_in(bounds) {
+                    Some(position) if self.picking && state.travel < CLICK_TRAVEL => {
+                        publish(Interaction::Click(position))
+                    }
+                    Some(position)
+                        if !self.picking && !self.cropping && state.travel < CLICK_TRAVEL =>
+                    {
+                        let anchor = position - Point::new(bounds.width / 2.0, bounds.height / 2.0);
+                        publish(Interaction::ToggleZoom(anchor))
+                    }
+                    _ => Some(Action::capture()),
+                }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) => {
                 state.rotate_from.take().map(|_| Action::capture())
@@ -629,6 +768,10 @@ impl<Message> shader::Program<Message> for Preview<'_, Message> {
                 cropping: self.cropping,
                 lens: self.lens,
                 point: false,
+                clip_highlights: self.clip_highlights,
+                clip_shadows: self.clip_shadows,
+                crossover: self.crossover,
+                grid: self.grid,
             }),
         }
     }
@@ -647,6 +790,14 @@ impl<Message> shader::Program<Message> for Preview<'_, Message> {
                 Drag::Zoom => mouse::Interaction::ResizingVertically,
                 Drag::Rotate { .. } => mouse::Interaction::ResizingHorizontally,
             }
+        } else if cursor
+            .position_in(bounds)
+            .is_some_and(|p| p.x < DIVIDER_GRAB || p.x > bounds.width - DIVIDER_GRAB)
+        {
+            // On the pane dividers' grab area: no pan hand.
+            mouse::Interaction::default()
+        } else if self.picking && cursor.is_over(bounds) {
+            mouse::Interaction::Crosshair
         } else if let Some(position) = cursor.position_in(bounds) {
             match self.cropping.then(|| self.drag_at(position, bounds.size())) {
                 Some(Drag::Zoom) => mouse::Interaction::ResizingVertically,
@@ -656,6 +807,50 @@ impl<Message> shader::Program<Message> for Preview<'_, Message> {
         } else {
             mouse::Interaction::default()
         }
+    }
+}
+
+/// White squares over the picked pixel sites `(y, x)` while picking: one
+/// image pixel big, at least `MARKER_MIN` px so they show when zoomed out.
+pub struct Markers<'a> {
+    pub sites: &'a [(usize, usize)],
+    pub view: ViewState,
+    pub image: Size,
+}
+
+const MARKER_MIN: f32 = 5.0;
+
+impl<Message> iced::widget::canvas::Program<Message> for Markers<'_> {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        let (scale, center) = self.view.resolve(bounds.size(), self.image);
+        let side = scale.max(MARKER_MIN);
+        let mut frame = iced::widget::canvas::Frame::new(renderer, bounds.size());
+        for &(y, x) in self.sites {
+            // the pixel's centre on screen
+            let at = Point::new(
+                bounds.width / 2.0 + (x as f32 + 0.5 - center.x) * scale,
+                bounds.height / 2.0 + (y as f32 + 0.5 - center.y) * scale,
+            );
+            if at.x < -side
+                || at.y < -side
+                || at.x > bounds.width + side
+                || at.y > bounds.height + side
+            {
+                continue;
+            }
+            let corner = Point::new(at.x - side / 2.0, at.y - side / 2.0);
+            frame.fill_rectangle(corner, Size::new(side, side), iced::Color::WHITE);
+        }
+        vec![frame.into_geometry()]
     }
 }
 
@@ -682,6 +877,12 @@ pub struct PrimitiveImage {
     /// Each target pixel is the output pixel under its centre, at any scale
     /// (for drawing a subset of the export's pixels).
     pub point: bool,
+    /// Draw clipped highlights black / clipped shadows white (the preview's
+    /// overlay; never the export's or the histogram's).
+    pub clip_highlights: bool,
+    pub clip_shadows: bool,
+    pub crossover: bool,
+    pub grid: bool,
 }
 
 #[repr(C)]
@@ -705,6 +906,12 @@ struct ViewUniform {
     /// Radius of the shaded frame's corners, in frame space (0 = square).
     corner: f32,
     point: u32,
+    clip_highlights: u32,
+    clip_shadows: u32,
+    crossover: u32,
+    /// 1: the rule-of-thirds grid (also pads `lens` to the shader's 16-byte
+    /// alignment).
+    grid_lines: u32,
     lens: LensUniform,
 }
 
@@ -727,6 +934,11 @@ pub struct PreviewPipeline {
     lens_lut: wgpu::Texture,
     lens_key: Option<(u64, Corrections)>,
     lens: LensUniform,
+    /// The widget's bounds in physical pixels, shrunk to whole pixels, set
+    /// by the widget's `prepare`: iced clips to the bounds rounded to the
+    /// nearest pixel, which can leave the picture one pixel over the
+    /// neighbouring panes' 1 px dividers.
+    scissor: Option<[u32; 4]>,
 }
 
 /// iced's device and queue, kept when the preview first builds its pipeline
@@ -867,13 +1079,13 @@ impl PreviewPipeline {
             }),
             lens_key: None,
             lens: LensUniform::zeroed(),
+            scissor: None,
         }
     }
 
-    /// Fills the lens table for `image` with the distortion and vignetting
-    /// in `on`, unless it already is.
+    /// Fills the lens table for `image` with the corrections in `on`
+    /// (distortion, vignetting, CA), unless it already is.
     fn update_lens(&mut self, queue: &wgpu::Queue, image: &Image, on: Corrections) {
-        let on = on.without(Corrections::CHROMATIC);
         if self.lens_key == Some((image.id, on)) {
             return;
         }
@@ -931,7 +1143,9 @@ impl PreviewPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&self.lens_lut.create_view(&Default::default())),
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.lens_lut.create_view(&Default::default()),
+                    ),
                 },
             ],
         }));
@@ -947,11 +1161,28 @@ impl shader::Primitive for PreviewPrimitive {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         bounds: &Rectangle,
-        _viewport: &Viewport,
+        viewport: &Viewport,
     ) {
+        let scale = viewport.scale_factor();
+        let left = (bounds.x * scale).ceil().max(0.0);
+        let top = (bounds.y * scale).ceil().max(0.0);
+        let right = ((bounds.x + bounds.width) * scale).floor();
+        let bottom = ((bounds.y + bounds.height) * scale).floor();
+        pipeline.scissor = (right > left && bottom > top).then(|| {
+            [
+                left as u32,
+                top as u32,
+                (right - left) as u32,
+                (bottom - top) as u32,
+            ]
+        });
         if let Some(p) = &self.image {
-            let new = pipeline.failed.as_ref().is_none_or(|(id, _)| *id != p.image.id);
-            if let Err(error) = pipeline.prepare_image(device, queue, p, [bounds.width, bounds.height])
+            let new = pipeline
+                .failed
+                .as_ref()
+                .is_none_or(|(id, _)| *id != p.image.id);
+            if let Err(error) =
+                pipeline.prepare_image(device, queue, p, [bounds.width, bounds.height])
                 && new
             {
                 crate::log::write(&format!("Error: {error}"));
@@ -961,6 +1192,10 @@ impl shader::Primitive for PreviewPrimitive {
 
     fn draw(&self, pipeline: &PreviewPipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
         if self.image.is_some() {
+            // Inside iced's own scissor, so this only ever shrinks it.
+            if let Some([x, y, w, h]) = pipeline.scissor {
+                render_pass.set_scissor_rect(x, y, w, h);
+            }
             pipeline.draw_image(render_pass);
         }
         true
@@ -981,7 +1216,11 @@ impl PreviewPipeline {
         p: &PrimitiveImage,
         viewport: [f32; 2],
     ) -> Result<(), String> {
-        if self.source.as_ref().is_none_or(|s| s.image_id != p.image.id) {
+        if self
+            .source
+            .as_ref()
+            .is_none_or(|s| s.image_id != p.image.id)
+        {
             if let Some((_, error)) = self.failed.as_ref().filter(|(id, _)| *id == p.image.id) {
                 return Err(error.clone());
             }
@@ -1016,7 +1255,10 @@ impl PreviewPipeline {
             encode_srgb: self.encode_srgb as u32,
             rotation: u32::from(p.rotation.0),
             shade: p.cropping as u32 as f32,
-            crop_center: [rotated.width / 2.0 + p.crop.offset.x, rotated.height / 2.0 + p.crop.offset.y],
+            crop_center: [
+                rotated.width / 2.0 + p.crop.offset.x,
+                rotated.height / 2.0 + p.crop.offset.y,
+            ],
             frame_size: [frame.width, frame.height],
             crop_cs: [p.crop.angle.cos(), p.crop.angle.sin()],
             corner: if p.cropping {
@@ -1025,13 +1267,21 @@ impl PreviewPipeline {
                 0.0
             },
             point: p.point as u32,
+            clip_highlights: p.clip_highlights as u32,
+            clip_shadows: p.clip_shadows as u32,
+            crossover: p.crossover as u32,
+            grid_lines: p.grid as u32,
             lens: self.lens,
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
 
         if p.adjustments.local_contrast != 0.0 {
             let lut = self.lens_lut.create_view(&Default::default());
-            let lens = (self.lens, &lut, self.lens_key.map_or(Corrections::NONE, |(_, on)| on));
+            let lens = (
+                self.lens,
+                &lut,
+                self.lens_key.map_or(Corrections::NONE, |(_, on)| on),
+            );
             if self.local.update(device, queue, &source, cam_to_srgb, lens) {
                 self.rebuild_view_group(device);
             }
@@ -1067,20 +1317,60 @@ mod tests {
     const IMAGE: Size = Size::new(6000.0, 4000.0);
 
     fn close(a: Point, b: Point) {
-        assert!((a.x - b.x).abs() < 1e-2 && (a.y - b.y).abs() < 1e-2, "{a:?} vs {b:?}");
+        assert!(
+            (a.x - b.x).abs() < 1e-2 && (a.y - b.y).abs() < 1e-2,
+            "{a:?} vs {b:?}"
+        );
+    }
+
+    #[test]
+    fn inscribed_frame_corners_lie_inside_the_image() {
+        for aspect in [Aspect::Original, Aspect::Ratio(1, 1), Aspect::Ratio(16, 9)] {
+            for degrees in [0.0f32, 1.0, -3.5, 10.0, 30.0] {
+                let crop = Crop {
+                    offset: Vector::new(5000.0, -5000.0),
+                    aspect,
+                    ..Crop::default()
+                }
+                .with_angle(degrees.to_radians())
+                .inscribed(IMAGE);
+                let f = crop.frame_size(IMAGE);
+                let mut touching = false;
+                for (x, y) in [(0.0, 0.0), (f.width, 0.0), (0.0, f.height), (f.width, f.height)] {
+                    let p = crop.to_image(Point::new(x, y), IMAGE);
+                    let eps = 0.05;
+                    assert!(p.x >= -eps && p.y >= -eps, "{aspect:?} {degrees}: {p:?}");
+                    assert!(
+                        p.x <= IMAGE.width + eps && p.y <= IMAGE.height + eps,
+                        "{aspect:?} {degrees}: {p:?}"
+                    );
+                    touching |= p.x < eps
+                        || p.y < eps
+                        || p.x > IMAGE.width - eps
+                        || p.y > IMAGE.height - eps;
+                }
+                assert!(touching, "{aspect:?} {degrees}: not as large as it can be");
+            }
+        }
     }
 
     #[test]
     fn default_crop_is_the_whole_image() {
         let crop = Crop::default();
         assert_eq!(crop.frame_size(IMAGE), IMAGE);
-        close(crop.to_image(Point::new(10.0, 20.0), IMAGE), Point::new(10.0, 20.0));
+        close(
+            crop.to_image(Point::new(10.0, 20.0), IMAGE),
+            Point::new(10.0, 20.0),
+        );
     }
 
     #[test]
     fn frame_takes_the_chosen_shape_inside_the_image() {
         for aspect in Aspect::ALL {
-            let crop = Crop { aspect, ..Crop::default() };
+            let crop = Crop {
+                aspect,
+                ..Crop::default()
+            };
             let frame = crop.frame_size(IMAGE);
             assert!(frame.width <= IMAGE.width + 1e-3 && frame.height <= IMAGE.height + 1e-3);
             // It touches the image on at least one axis.
@@ -1093,12 +1383,17 @@ mod tests {
 
     #[test]
     fn zoom_keeps_the_point_under_the_cursor() {
-        let crop = Crop::default().tilt_by(0.4).pan_by(Vector::new(30.0, -12.0), 0.1);
+        let crop = Crop::default()
+            .tilt_by(0.4)
+            .pan_by(Vector::new(30.0, -12.0), 0.1);
         let scale = crop.scale(Size::new(1200.0, 800.0), IMAGE);
         let anchor = Vector::new(-150.0, 90.0);
         let frame_point = |c: &Crop, s: f32| {
             let f = c.frame_size(IMAGE);
-            c.to_image(Point::new(f.width / 2.0 + anchor.x / s, f.height / 2.0 + anchor.y / s), IMAGE)
+            c.to_image(
+                Point::new(f.width / 2.0 + anchor.x / s, f.height / 2.0 + anchor.y / s),
+                IMAGE,
+            )
         };
         let zoomed = crop.zoom_by(1.7, anchor, scale);
         close(frame_point(&crop, scale), frame_point(&zoomed, scale * 1.7));
@@ -1119,16 +1414,41 @@ mod tests {
     }
 
     #[test]
+    fn exif_orientation_turns_the_image_upright() {
+        let size = Size::new(6.0, 4.0);
+        assert_eq!(Rotation::from_exif(1), Rotation::default());
+        assert_eq!(Rotation::from_exif(0), Rotation::default());
+        assert_eq!(Rotation::from_exif(3).size(size), size);
+        // A portrait shot: the landscape frame ends up taller than wide.
+        for orientation in [6, 8] {
+            let turned = Rotation::from_exif(orientation).size(size);
+            assert_eq!(turned, Size::new(4.0, 6.0));
+        }
+        assert_eq!(Rotation::from_exif(6), Rotation::CLOCKWISE);
+        assert_eq!(Rotation::from_exif(8), Rotation::COUNTER_CLOCKWISE);
+    }
+
+    #[test]
     fn quarter_turns_agree_with_the_crop() {
         let size = Size::new(6000.0, 4000.0);
-        for turn in [Rotation::CLOCKWISE, Rotation::COUNTER_CLOCKWISE, Rotation::CLOCKWISE.then(Rotation::CLOCKWISE)] {
+        for turn in [
+            Rotation::CLOCKWISE,
+            Rotation::COUNTER_CLOCKWISE,
+            Rotation::CLOCKWISE.then(Rotation::CLOCKWISE),
+        ] {
             let p = Point::new(1234.0, 567.0);
             close(turn.unapply(turn.apply(p, size), size), p);
             let v = Vector::new(100.0, -30.0);
-            let moved = turn.apply(Point::new(size.width / 2.0 + v.x, size.height / 2.0 + v.y), size);
+            let moved = turn.apply(
+                Point::new(size.width / 2.0 + v.x, size.height / 2.0 + v.y),
+                size,
+            );
             let rotated = turn.size(size);
             let w = turn.vector(v);
-            close(moved, Point::new(rotated.width / 2.0 + w.x, rotated.height / 2.0 + w.y));
+            close(
+                moved,
+                Point::new(rotated.width / 2.0 + w.x, rotated.height / 2.0 + w.y),
+            );
         }
     }
 
@@ -1136,11 +1456,22 @@ mod tests {
     fn shader_is_valid() {
         let source = format!("{}\n{PREVIEW_SHADER}", develop::SHADER);
         let module = naga::front::wgsl::parse_str(&source).unwrap();
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-            .validate(&module)
-            .unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
         // The Rust uniform must fill the WGSL struct exactly.
-        let view = module.types.iter().find(|(_, t)| t.name.as_deref() == Some("View")).unwrap().1;
-        assert_eq!(view.inner.size(module.to_ctx()) as usize, std::mem::size_of::<ViewUniform>());
+        let view = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("View"))
+            .unwrap()
+            .1;
+        assert_eq!(
+            view.inner.size(module.to_ctx()) as usize,
+            std::mem::size_of::<ViewUniform>()
+        );
     }
 }

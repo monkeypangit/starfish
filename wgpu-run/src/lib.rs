@@ -7,9 +7,12 @@
 //!
 //! The graph is built for one fixed window (e.g. 1056 x 1056). An image of any
 //! size is processed as overlapping windows: each keeps `halo` px of context
-//! around the core it writes, and windows wrap around the image edge, because
-//! the network pads circularly. The result is identical to running the whole
-//! image at once. A window whose core is cut short at the image's end only
+//! around the core it writes, and windows wrap around the image edge (the
+//! convs pad with zeros, which reaches no core pixel; a network that pads
+//! circularly needs the wrap). The result is identical to running the whole
+//! image at once, but within `halo` px of the image edge for a zero-padded
+//! network (the whole image would see zeros there; the app pads, so never
+//! outputs those pixels). A window whose core is cut short at the image's end only
 //! holds image data in its first core + 2 * halo rows and columns, which is
 //! all that core needs: the ops are told that size (binding 5) and skip the
 //! work beyond it.
@@ -80,7 +83,8 @@ struct Window {
     ox: u32, // image position of the output texture's origin
     gain: [f32; 3],
     a: f32,
-    b: f32, // `run_raw`'s white balance and noise model; unused otherwise
+    b: f32,            // `run_raw`'s white balance and noise model; unused otherwise
+    filter_grain: u32, // `RawInput::filter_grain`
 }
 
 /// The rows and columns of the window that hold image data, from its top
@@ -106,7 +110,43 @@ pub struct RawInput<'a> {
     pub gain: [f32; 3],
     pub a: f64,
     pub b: f64,
+    /// The output's alpha, the grain, as the mean of the middle 5 of the 9
+    /// grains around each pixel instead of its own (see the place shader's
+    /// `middle5`): like a 3x3 median it rejects the extremes, so it keeps
+    /// structure, but it does not leave the median's specks and short
+    /// streaks (flat patches where neighbours pick the same sample).
+    pub filter_grain: bool,
 }
+
+/// A 9-input sorting network (25 compare-exchanges in 7 layers; checked on
+/// every 0-1 input, which by the 0-1 principle sorts any input).
+const SORT9: [(u32, u32); 25] = [
+    (0, 3),
+    (1, 7),
+    (2, 5),
+    (4, 8),
+    (0, 7),
+    (2, 4),
+    (3, 8),
+    (5, 6),
+    (0, 2),
+    (1, 3),
+    (4, 5),
+    (7, 8),
+    (1, 4),
+    (3, 6),
+    (5, 7),
+    (0, 1),
+    (2, 4),
+    (3, 5),
+    (6, 8),
+    (2, 3),
+    (4, 5),
+    (6, 7),
+    (1, 2),
+    (3, 4),
+    (5, 6),
+];
 
 /// Workgroup edge of the cut and place shaders.
 const WG: u32 = 16;
@@ -153,6 +193,13 @@ impl Model {
                 Some("mosaic") => mosaic = num(f[1])? as usize,
                 Some("sigma") => sigma = num(f[1])? as usize,
                 Some("output") => output = num(f[1])? as usize,
+                Some("ca") => {
+                    return Err(
+                        "this export takes the lateral CA as an input, which is no longer \
+                                supported (the CA is taken out of the mosaic); re-export it"
+                            .into(),
+                    )
+                }
                 Some("buffer") => {
                     let size = num(f[2])?;
                     if size > device.limits().max_storage_buffer_binding_size as u64 {
@@ -300,7 +347,7 @@ impl Model {
     }
 
     /// The network's reach: an output pixel depends on input pixels at most
-    /// this far away. Pixels this far from the edge never see the wrap-around.
+    /// this far away. Pixels this far from the edge never see the padding or the wrap-around.
     pub fn halo(&self) -> u32 {
         self.halo
     }
@@ -412,7 +459,7 @@ impl Model {
         let (mosaic, sigma) = (view(mosaic), view(sigma));
         self.run_windows(
             (h, w),
-            ([0.0; 3], 0.0, 0.0),
+            ([0.0; 3], 0.0, 0.0, false),
             &self.cut,
             &[
                 wgpu::BindingResource::TextureView(&mosaic),
@@ -453,7 +500,12 @@ impl Model {
         let frame = input.frame.create_view(&Default::default());
         self.run_windows(
             (h, w),
-            (input.gain, input.a as f32, input.b as f32),
+            (
+                input.gain,
+                input.a as f32,
+                input.b as f32,
+                input.filter_grain,
+            ),
             &self.cut_raw,
             &[
                 wgpu::BindingResource::TextureView(&frame),
@@ -472,7 +524,7 @@ impl Model {
     fn run_windows(
         &self,
         (h, w): (u32, u32),
-        (gain, a, b): ([f32; 3], f32, f32),
+        (gain, a, b, filter): ([f32; 3], f32, f32, bool),
         cut_pipeline: &wgpu::ComputePipeline,
         inputs: &[wgpu::BindingResource],
         output: &wgpu::Texture,
@@ -513,12 +565,14 @@ impl Model {
                     gain,
                     a,
                     b,
+                    filter_grain: filter as u32,
                 });
             }
         }
         // one uniform buffer, each window at an aligned offset
         let size = std::mem::size_of::<Window>() as u64;
-        let stride = size.next_multiple_of(self.device.limits().min_uniform_buffer_offset_alignment as u64);
+        let stride =
+            size.next_multiple_of(self.device.limits().min_uniform_buffer_offset_alignment as u64);
         let mut params = vec![0u8; stride as usize * wins.len()];
         for (i, win) in wins.iter().enumerate() {
             params[i * stride as usize..][..size as usize].copy_from_slice(bytemuck::bytes_of(win));
@@ -580,6 +634,8 @@ impl Model {
                 &[
                     self.bufs[self.output].as_entire_binding(),
                     wgpu::BindingResource::TextureView(&output),
+                    self.bufs[self.mosaic].as_entire_binding(),
+                    self.bufs[self.sigma].as_entire_binding(),
                 ],
             );
             let valid = self.set_valid((win.cy1 - win.cy0) as usize, (win.cx1 - win.cx0) as usize);
@@ -708,11 +764,15 @@ fn window_pipelines(
     (th, tw): (u32, u32),
     halo: u32,
     cfa: &[u32],
-) -> (wgpu::ComputePipeline, wgpu::ComputePipeline, wgpu::ComputePipeline) {
+) -> (
+    wgpu::ComputePipeline,
+    wgpu::ComputePipeline,
+    wgpu::ComputePipeline,
+) {
     let header = format!("{}alias T = {};
 
 struct Window {{ y0: u32, x0: u32, h: u32, w: u32, cy0: u32, cy1: u32, cx0: u32, cx1: u32, oy: u32, ox: u32,
-                 g0: f32, g1: f32, g2: f32, a: f32, b: f32 }}
+                 g0: f32, g1: f32, g2: f32, a: f32, b: f32, filter_grain: u32 }}
 @group(0) @binding(0) var<uniform> win: Window;
 
 const TH: u32 = {th}u;  // window
@@ -739,7 +799,11 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {{
     // noise::inputs, per window: the image pixel's frame pixel, balanced by
     // the gain of its CFA colour, and its sigma
     let period = (cfa.len() as f64).sqrt() as usize;
-    let colors = cfa.iter().map(|c| format!("{c}u")).collect::<Vec<_>>().join(", ");
+    let colors = cfa
+        .iter()
+        .map(|c| format!("{c}u"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let cut_raw = format!(
         "{header}
 @group(0) @binding(1) var frame: texture_2d<f32>;
@@ -765,10 +829,24 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {{
 ",
         n = cfa.len()
     );
+    // The output's alpha is the grain: what the network took out at the
+    // pixel's own sample (mosaic - output), divided by the sample's sigma and
+    // scaled to green's noise at the output's level, so it is as strong
+    // whatever the sample's colour. The developer adds a fraction of it to
+    // R, G and B to put noise back. 0 where the sample is clipped or there is
+    // no noise model (run_texture). `win.filter_grain` (`RawInput::filter_grain`)
+    // takes the mean of the middle 5 of the 3x3 grains instead.
     let place = format!(
         "{header}
 @group(0) @binding(1) var<storage, read> rgb: array<T>;  // 3 x TH x TW
 @group(0) @binding(2) var dst: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var<storage, read> mos: array<T>;  // the window's inputs, as cut made them
+@group(0) @binding(4) var<storage, read> sig: array<T>;
+
+const P: u32 = {period}u;
+const CFA = array<u32, {n}>({colors});
+// raw samples at or above this (white = 1) are clipped: no grain
+const CLIPPED: f32 = 0.98;
 
 @compute @workgroup_size({WG}, {WG}, 1)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {{
@@ -780,9 +858,56 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {{
     // image -> output coordinates; whatever falls outside the output is cropped
     let o = vec2<i32>(i32(win.cx0 + g.x) - i32(win.ox), i32(win.cy0 + g.y) - i32(win.oy));
     if (any(o < vec2<i32>(0)) || any(o >= vec2<i32>(textureDimensions(dst)))) {{ return; }}
-    textureStore(dst, o, vec4<f32>(c, 1.0));
+    var z = grain_at(i, win.cy0 + g.y, win.cx0 + g.x);
+    if (win.filter_grain != 0u) {{
+        // the 3x3 around it (the core is HALO px inside its window, so the
+        // neighbours are in the buffers): grains n, row-major, centre n[4]
+        var n: array<f32, 9>;
+        for (var k = 0u; k < 9u; k++) {{
+            let dy = k / 3u;
+            let dx = k % 3u;
+            let j = i + dy * TW + dx - TW - 1u;
+            n[k] = grain_at(j, win.cy0 + g.y + dy + P - 1u, win.cx0 + g.x + dx + P - 1u);
+        }}
+        z = middle5(n);
+    }}
+    textureStore(dst, o, vec4<f32>(c, z));
 }}
-"
+
+// The mean of ranks 3-7 of the nine grains n: sorted by SORT9 in registers,
+// branch-free.
+fn middle5(n: array<f32, 9>) -> f32 {{
+    var v0 = n[0]; var v1 = n[1]; var v2 = n[2]; var v3 = n[3]; var v4 = n[4];
+    var v5 = n[5]; var v6 = n[6]; var v7 = n[7]; var v8 = n[8];
+{sort9}
+    return (v2 + v3 + v4 + v5 + v6) / 5.0;
+}}
+
+// The grain of one pixel (window index i, image pixel (y, x), mod P): the
+// network's residual at its sample in units of the sample's sigma, times
+// green's noise at the pixel's output level, so as strong whatever the
+// sample's colour; 0 where clipped or without a noise model.
+fn grain_at(i: u32, y: u32, x: u32) -> f32 {{
+    let k = CFA[(y % P) * P + x % P];
+    let gains = vec3<f32>(win.g0, win.g1, win.g2);
+    let m = f32(mos[i]);
+    let s = f32(sig[i]);
+    if (s <= 0.0 || m >= CLIPPED * gains[k]) {{
+        return 0.0;
+    }}
+    let plane = TH * TW;
+    let green = sqrt(max(win.a * max(f32(rgb[plane + i]), 0.0) / win.g1 + win.b, 0.0)) * win.g1;
+    return (m - f32(rgb[k * plane + i])) / s * green;
+}}
+",
+        n = cfa.len(),
+        sort9 = SORT9
+            .iter()
+            .map(|(a, b)| format!(
+                "    {{ let t = min(v{a}, v{b}); v{b} = max(v{a}, v{b}); v{a} = t; }}"
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 
     let uniform = wgpu::BindingType::Buffer {
@@ -849,9 +974,19 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {{
         pipeline(
             "cut raw",
             cut_raw,
-            &[uniform, texture, storage(true), storage(false), storage(false)],
+            &[
+                uniform,
+                texture,
+                storage(true),
+                storage(false),
+                storage(false),
+            ],
         ),
-        pipeline("place", place, &[uniform, storage(true), output]),
+        pipeline(
+            "place",
+            place,
+            &[uniform, storage(true), output, storage(true), storage(true)],
+        ),
     )
 }
 

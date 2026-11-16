@@ -6,6 +6,8 @@
 //!   demosaic-run training/xtrans_wgpu --size 4000x6000 --bench 5
 //!   options: --png FILE (sRGB image), --f32 (use the f32 export even when
 //!            f16 is supported), --dump FILE (raw f32 output, 3 x h x w),
+//!            --inputs FILE (u32 h, u32 w, f32[9] srgb_from_cam, mosaic[h*w],
+//!            sigma[h*w]: the network's inputs, as test.bin starts),
 //!            --gpu (Model::run_texture instead of Model::run; --bench then
 //!            times the GPU work alone, inputs uploaded once)
 
@@ -25,12 +27,13 @@ const OPTS: &[&str] = &[
     "--size",
     "--bench",
     "--dump",
+    "--inputs",
 ];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = "usage: demosaic-run EXPORT_DIR [--raw FILE [--crop X,Y,W,H] [--exposure E] \
-                 [--auto-exposure] [--a A --b B]] [--size HxW] [--png FILE] [--bench N] [--f32] [--gpu] [--dump FILE]";
+                 [--auto-exposure] [--a A --b B]] [--size HxW] [--png FILE] [--bench N] [--f32] [--gpu] [--dump FILE] [--inputs FILE]";
     let dir = Path::new(args.get(1).unwrap_or_else(|| exit(usage)));
     let mut i = 2;
     while i < args.len() {
@@ -107,6 +110,14 @@ fn main() {
         r
     };
 
+    if let Some(p) = opt("--inputs") {
+        let mut b = bytemuck::cast_slice::<u32, u8>(&[h, w]).to_vec();
+        for v in [&srgb_from_cam, &mos, &sig] {
+            b.extend_from_slice(bytemuck::cast_slice::<f32, u8>(v));
+        }
+        std::fs::write(&p, b).unwrap();
+    }
+
     let gpu = flag("--gpu");
     let t0 = Instant::now();
     let y = if gpu {
@@ -124,22 +135,28 @@ fn main() {
 
     let n = (h * w) as usize;
     if let Some(t) = &test {
-        let maxerr = y
-            .iter()
-            .zip(&t.reference)
-            .map(|(a, b)| (a - b).abs())
+        // PyTorch pads the image with zeros, the windows see the image wrapped
+        // round: the two differ within the halo of the edge
+        let b = (model.halo() as usize).max(8);
+        let (hu, wu) = (h as usize, w as usize);
+        let maxerr = (0..3 * hu * wu)
+            .filter(|i| {
+                let (py, px) = (i % (hu * wu) / wu, i % wu);
+                (b..hu - b).contains(&py) && (b..wu - b).contains(&px)
+            })
+            .map(|i| (y[i] - t.reference[i]).abs())
             .fold(0f32, f32::max);
         let ys = to_srgb_lin(&y, &t.srgb_from_cam, n);
         let rs = to_srgb_lin(&t.reference, &t.srgb_from_cam, n);
-        let (hu, wu) = (h as usize, w as usize);
         println!(
-            "vs PyTorch fp32: max |err| {maxerr:.5} (camera space), PSNR {:.2} dB (linear sRGB)",
-            psnr(&ys, &rs, hu, wu, 8)
+            "vs PyTorch fp32: max |err| {maxerr:.5} (camera space), PSNR {:.2} dB (linear sRGB), \
+             {b} px border dropped",
+            psnr(&ys, &rs, hu, wu, b)
         );
         println!(
             "vs truth: wgpu {:.2} dB, PyTorch fp32 {:.2} dB",
-            psnr(&ys, &t.clean, hu, wu, 8),
-            psnr(&rs, &t.clean, hu, wu, 8)
+            psnr(&ys, &t.clean, hu, wu, b),
+            psnr(&rs, &t.clean, hu, wu, b)
         );
     }
     if let Some(p) = opt("--png") {
@@ -334,8 +351,8 @@ struct Test {
     clean: Vec<f32>,
 }
 
-/// u32 h, u32 w, f32[9] srgb_from_cam, mosaic[h*w], sigma[h*w],
-/// PyTorch output[3*h*w], clean linear sRGB[3*h*w]
+/// u32 h, u32 w, f32[9] srgb_from_cam, mosaic[h*w], sigma[h*w], PyTorch
+/// output[3*h*w], clean linear sRGB[3*h*w]
 fn read_test(path: &Path) -> Test {
     let b = std::fs::read(path).unwrap_or_else(|e| exit(&format!("{}: {e}", path.display())));
     let h = u32::from_le_bytes(b[0..4].try_into().unwrap());

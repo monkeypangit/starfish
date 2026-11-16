@@ -61,11 +61,7 @@ pub struct LocalContrast {
     base: Option<Base>,
 }
 
-fn texture(
-    device: &wgpu::Device,
-    size: (u32, u32),
-    format: wgpu::TextureFormat,
-) -> wgpu::Texture {
+fn texture(device: &wgpu::Device, size: (u32, u32), format: wgpu::TextureFormat) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("local contrast"),
         size: wgpu::Extent3d {
@@ -97,7 +93,8 @@ fn texture_entry(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
 
 impl LocalContrast {
     pub fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(develop::shader("local", include_str!("shaders/local.wgsl")));
+        let module = device
+            .create_shader_module(develop::shader("local", include_str!("shaders/local.wgsl")));
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("local contrast"),
             entries: &[
@@ -161,13 +158,18 @@ impl LocalContrast {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let overview_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("local contrast overview"),
-            bind_group_layouts: &[&overview_layout],
-            push_constant_ranges: &[],
-        });
+        let overview_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("local contrast overview"),
+                bind_group_layouts: &[&overview_layout],
+                push_constant_ranges: &[],
+            });
         let pipeline = |entry, format: wgpu::TextureFormat| {
-            let layout = if entry == "fs_overview" { &overview_pipeline_layout } else { &pipeline_layout };
+            let layout = if entry == "fs_overview" {
+                &overview_pipeline_layout
+            } else {
+                &pipeline_layout
+            };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry),
                 layout: Some(layout),
@@ -276,11 +278,17 @@ impl LocalContrast {
         let radius = ((size.0.max(size.1) as f32 * RADIUS).round() as i32).max(1);
 
         let overview = texture(device, size, IMAGE_FORMAT);
-        let sums = [texture(device, size, SUM_FORMAT), texture(device, size, SUM_FORMAT)];
+        let sums = [
+            texture(device, size, SUM_FORMAT),
+            texture(device, size, SUM_FORMAT),
+        ];
         let base = texture(device, size, IMAGE_FORMAT);
         let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
-        let (overview_view, sum_views, base_view) =
-            (view(&overview), [view(&sums[0]), view(&sums[1])], view(&base));
+        let (overview_view, sum_views, base_view) = (
+            view(&overview),
+            [view(&sums[0]), view(&sums[1])],
+            view(&base),
+        );
 
         queue.write_buffer(
             &self.params,
@@ -385,7 +393,10 @@ impl LocalContrast {
         }
         queue.submit([encoder.finish()]);
 
-        self.base = Some(Base { key, view: base_view });
+        self.base = Some(Base {
+            key,
+            view: base_view,
+        });
         true
     }
 }
@@ -396,13 +407,28 @@ mod tests {
 
     #[test]
     fn shader_is_valid() {
-        let source = format!("{}\n{}", develop::SHADER, include_str!("shaders/local.wgsl"));
+        let source = format!(
+            "{}\n{}",
+            develop::SHADER,
+            include_str!("shaders/local.wgsl")
+        );
         let module = naga::front::wgsl::parse_str(&source).unwrap();
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-            .validate(&module)
-            .unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
         // The Rust uniform must fill the WGSL struct exactly.
-        let params = module.types.iter().find(|(_, t)| t.name.as_deref() == Some("Params")).unwrap().1;
-        assert_eq!(params.inner.size(module.to_ctx()) as usize, std::mem::size_of::<Params>());
+        let params = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("Params"))
+            .unwrap()
+            .1;
+        assert_eq!(
+            params.inner.size(module.to_ctx()) as usize,
+            std::mem::size_of::<Params>()
+        );
     }
 }

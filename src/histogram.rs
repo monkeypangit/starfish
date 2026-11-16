@@ -11,12 +11,15 @@ use iced::advanced::widget::{Tree, Widget};
 use iced::advanced::{Clipboard, Layout, Shell, layout, renderer};
 use iced::widget::Action;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
-use iced::{Color, Element, Event, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
+use iced::{
+    Color, Element, Event, Length, Point, Rectangle, Renderer, Size, Theme, keyboard, mouse,
+};
 
-use crate::agx::{self, Curve};
 use crate::export;
-use crate::preview::{self, MID_GRAY, PreviewPipeline, PrimitiveImage};
+use crate::preview::{self, PreviewPipeline, PrimitiveImage};
 use crate::processing::Image;
+use crate::tone::{self, Curve};
+use crate::{pill, styling};
 
 const BINS: usize = 256;
 /// Enough for a smooth histogram while recomputing on every slider step.
@@ -97,7 +100,9 @@ impl Pass {
             bins: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("histogram bins"),
                 size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             readback: device.create_buffer(&wgpu::BufferDescriptor {
@@ -120,7 +125,9 @@ impl Pass {
         // pixel i · stride + stride / 2, its centre drawn exactly there (with
         // an even stride, (i + 0.5) · stride would fall on a pixel edge).
         let (width, height) = export::frame_pixels(image, view.rotation, view.crop);
-        let stride = ((width as f32 * height as f32 / MAX_SAMPLES as f32).sqrt().ceil() as u32)
+        let stride = ((width as f32 * height as f32 / MAX_SAMPLES as f32)
+            .sqrt()
+            .ceil() as u32)
             .max(width.div_ceil(MAX_SIDE))
             .max(height.div_ceil(MAX_SIDE))
             .max(1);
@@ -130,7 +137,10 @@ impl Pass {
             scale: 1.0 / stride as f32,
             center: {
                 let offset = (stride / 2) as f32 + 0.5 - stride as f32 / 2.0;
-                Point::new((w * stride) as f32 / 2.0 + offset, (h * stride) as f32 / 2.0 + offset)
+                Point::new(
+                    (w * stride) as f32 / 2.0 + offset,
+                    (h * stride) as f32 / 2.0 + offset,
+                )
             },
             adjustments: view.adjustments,
             rotation: view.rotation,
@@ -138,8 +148,13 @@ impl Pass {
             cropping: false,
             lens: view.lens,
             point: true,
+            clip_highlights: false,
+            clip_shadows: false,
+            crossover: false,
+            grid: false,
         };
-        self.draw.prepare_image(device, queue, &shot, [w as f32, h as f32])?;
+        self.draw
+            .prepare_image(device, queue, &shot, [w as f32, h as f32])?;
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("histogram"),
@@ -230,7 +245,7 @@ impl Pass {
     }
 }
 
-fn srgb_decode(c: f32) -> f32 {
+pub fn srgb_decode(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
     } else {
@@ -248,9 +263,9 @@ fn srgb_encode(c: f32) -> f32 {
 
 /// Draws the histogram (if an image is loaded) and, over it, the tone curve:
 /// curve input left to right, output bottom to top, both sRGB-encoded 0..1
-/// like the histogram's bins (the curve itself works in `agx`'s power-2.4
-/// encoding, converted here), with the diagonal for reference and a dot where
-/// they cross. For grey pixels with neutral saturation and grading the
+/// like the histogram's bins (the curve itself works in `tone`'s power-2.4
+/// encoding, converted here), with the diagonal for reference and a vertical line (the midpoint)
+/// where they cross. For grey pixels with neutral saturation and grading the
 /// output axis is exactly the histogram's.
 pub struct View<'a, Message> {
     pub histogram: Option<&'a Histogram>,
@@ -258,37 +273,96 @@ pub struct View<'a, Message> {
     /// Gets the wanted height as a fraction of the width while the lower
     /// border is dragged.
     pub on_resize: fn(f32) -> Message,
+    /// Gets the wanted midpoint's x (sRGB-encoded, 0..1) while the midpoint
+    /// line is dragged sideways.
+    pub on_midpoint: fn(f32) -> Message,
+    /// Gets the wanted y (sRGB-encoded, 0..1) of the contrast handle, the dot
+    /// on the curve's highlight side, while it is dragged up or down.
+    pub on_contrast: fn(f32) -> Message,
+    /// Sent when a drag of the line or the knob ends.
+    pub on_release: fn() -> Message,
 }
+
+/// What a press on the histogram has hold of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Drag {
+    #[default]
+    None,
+    Border,
+    Midpoint,
+    Contrast,
+}
+
+/// The press on the histogram: what it holds, and where that is.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct State {
+    drag: Drag,
+    /// Shift is down: a drag moves [`FINE`] as far.
+    fine: bool,
+    /// The cursor at the last move, and the handle's place (0..1, y up).
+    last: Point,
+    at: (f32, f32),
+}
+
+/// How far a drag with Shift held moves, against a plain one.
+const FINE: f32 = 0.1;
+
+/// How close (px) the cursor must be to the contrast knob to take it, and to
+/// the midpoint line.
+const HANDLE_REACH: f32 = 9.0;
+const LINE_REACH: f32 = 5.0;
 
 /// Grabbable height of the lower border.
 const GRAB: f32 = 8.0;
 
 impl<Message> canvas::Program<Message> for View<'_, Message> {
-    /// Whether the lower border is being dragged.
-    type State = bool;
+    type State = State;
 
     fn update(
         &self,
-        dragging: &mut bool,
+        state: &mut State,
         event: &Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<Action<Message>> {
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let on_border = cursor
-                    .position_in(bounds)
-                    .is_some_and(|p| p.y >= bounds.height - GRAB);
-                *dragging = on_border;
-                on_border.then(Action::capture)
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.fine = modifiers.shift();
+                None
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if *dragging => Some(
-                Action::publish((self.on_resize)((position.y - bounds.y) / bounds.width))
-                    .and_capture(),
-            ),
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if *dragging => {
-                *dragging = false;
-                Some(Action::capture())
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let inside = cursor.position_in(bounds);
+                state.drag = self.grab_at(inside, bounds.size());
+                let ((mx, my), (cx, cy)) = self.handles();
+                state.at = if state.drag == Drag::Contrast { (cx, cy) } else { (mx, my) };
+                state.last = cursor.position().unwrap_or(Point::ORIGIN);
+                (state.drag != Drag::None).then(Action::capture)
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag != Drag::None => {
+                // Relative to the handle where it was taken, so it does not
+                // jump to the cursor and Shift can slow it down.
+                let k = if state.fine { FINE } else { 1.0 };
+                state.at.0 += (position.x - state.last.x) / bounds.width * k;
+                state.at.1 -= (position.y - state.last.y) / bounds.height * k;
+                state.last = *position;
+                state.at = (state.at.0.clamp(0.0, 1.0), state.at.1.clamp(0.0, 1.0));
+                let (x, y) = state.at;
+                let message = match state.drag {
+                    Drag::Border => (self.on_resize)((position.y - bounds.y) / bounds.width),
+                    Drag::Midpoint => (self.on_midpoint)(x),
+                    _ => (self.on_contrast)(y),
+                };
+                Some(Action::publish(message).and_capture())
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if state.drag != Drag::None =>
+            {
+                let was = std::mem::take(&mut state.drag);
+                Some(if was == Drag::Border {
+                    Action::capture()
+                } else {
+                    Action::publish((self.on_release)()).and_capture()
+                })
             }
             _ => None,
         }
@@ -296,23 +370,24 @@ impl<Message> canvas::Program<Message> for View<'_, Message> {
 
     fn mouse_interaction(
         &self,
-        dragging: &bool,
+        state: &State,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        let on_border = cursor
-            .position_in(bounds)
-            .is_some_and(|p| p.y >= bounds.height - GRAB);
-        if *dragging || on_border {
-            mouse::Interaction::ResizingVertically
+        match if state.drag == Drag::None {
+            self.grab_at(cursor.position_in(bounds), bounds.size())
         } else {
-            mouse::Interaction::None
+            state.drag
+        } {
+            Drag::Border | Drag::Contrast => mouse::Interaction::ResizingVertically,
+            Drag::Midpoint => mouse::Interaction::ResizingHorizontally,
+            Drag::None => mouse::Interaction::None,
         }
     }
 
     fn draw(
         &self,
-        _state: &bool,
+        _state: &State,
         renderer: &Renderer,
         theme: &Theme,
         bounds: Rectangle,
@@ -322,42 +397,71 @@ impl<Message> canvas::Program<Message> for View<'_, Message> {
         let (width, height) = (bounds.width, bounds.height);
         let text = theme.palette().text;
 
-        frame.fill_rectangle(Point::ORIGIN, bounds.size(), Color { a: 0.05, ..text });
-        frame.fill_rectangle(
-            Point::new(0.0, height - 1.0),
-            Size::new(width, 1.0),
-            Color { a: 0.15, ..text },
-        );
-        // Where 18% grey lands on screen.
-        let mid = srgb_encode(MID_GRAY) * width;
-        frame.fill_rectangle(
-            Point::new(mid, 0.0),
-            Size::new(1.0, height),
-            Color { a: 0.1, ..text },
-        );
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), Color { a: styling::BAR_ALPHA, ..text });
+        // Mask the corners afterwards: the frame clips to rectangles only.
+        let surround = styling::panel_color(theme);
+        let r = pill::RADIUS.min(width / 2.0).min(height / 2.0);
+        let corners = [
+            (Point::new(0.0, 0.0), 1.0, 1.0),
+            (Point::new(width, 0.0), -1.0, 1.0),
+            (Point::new(0.0, height), 1.0, -1.0),
+            (Point::new(width, height), -1.0, -1.0),
+        ];
 
         if let Some(histogram) = self.histogram {
             draw_bins(&mut frame, histogram);
         }
-        self.draw_curve(&mut frame, text);
+        // A shade darker than the text, so the curve sits behind the data.
+        let curve = Color::from_rgb(text.r * 0.75, text.g * 0.75, text.b * 0.75);
+        self.draw_curve(&mut frame, curve);
+        for (corner, sx, sy) in corners {
+            frame.fill(&corner_mask(corner, sx, sy, r), surround);
+        }
         vec![frame.into_geometry()]
     }
 }
 
 impl<Message> View<'_, Message> {
+    /// The midpoint (its x) and the contrast knob, in the histogram's own
+    /// 0..1 (x right, y up) encoding.
+    fn handles(&self) -> ((f32, f32), (f32, f32)) {
+        let encode = |tone_value: f32| srgb_encode(tone::decode(tone_value));
+        let pivot = encode(self.curve.pivot_x);
+        let reference = tone::reference(self.curve.pivot_x);
+        (
+            (pivot, pivot),
+            (encode(reference), encode(self.curve.apply(reference))),
+        )
+    }
+
+    /// What a press at `position` (in the widget) takes: a dot if one is
+    /// near, else the lower border.
+    fn grab_at(&self, position: Option<Point>, size: Size) -> Drag {
+        let Some(p) = position else {
+            return Drag::None;
+        };
+        let ((mx, _), (cx, cy)) = self.handles();
+        let to_knob = ((p.x - cx * size.width).powi(2) + (p.y - (1.0 - cy) * size.height).powi(2))
+            .sqrt();
+        if to_knob <= HANDLE_REACH {
+            Drag::Contrast
+        } else if (p.x - mx * size.width).abs() <= LINE_REACH {
+            Drag::Midpoint
+        } else if p.y >= size.height - GRAB {
+            Drag::Border
+        } else {
+            Drag::None
+        }
+    }
+
     fn draw_curve(&self, frame: &mut Frame, color: Color) {
         let (width, height) = (frame.width(), frame.height());
         let at = |x: f32, y: f32| Point::new(x * width, (1.0 - y) * height);
         // sRGB-encoded input → curve → sRGB-encoded output.
         let plot = |x: f32| {
-            let y = self.curve.apply(agx::encode(srgb_decode(x)));
-            srgb_encode(agx::decode(y))
+            let y = self.curve.apply(tone::encode(srgb_decode(x)));
+            srgb_encode(tone::decode(y))
         };
-
-        let faint = Stroke::default()
-            .with_width(1.0)
-            .with_color(Color { a: 0.15, ..color });
-        frame.stroke(&Path::line(at(0.0, 0.0), at(1.0, 1.0)), faint);
 
         let steps = width.ceil().max(1.0) as usize;
         let curve = Path::new(|builder| {
@@ -372,10 +476,33 @@ impl<Message> View<'_, Message> {
             .with_color(Color { a: 0.8, ..color });
         frame.stroke(&curve, line);
 
-        let pivot = srgb_encode(agx::decode(self.curve.pivot_x));
-        let crossover = at(pivot, pivot);
-        frame.fill(&Path::circle(crossover, 3.0), Color { a: 0.9, ..color });
+        let pivot = srgb_encode(tone::decode(self.curve.pivot_x));
+        // The midpoint: a vertical line through the crossover, which can be
+        // taken anywhere along it.
+        let line = Path::line(at(pivot, 0.0), at(pivot, 1.0));
+        frame.stroke(&line, Stroke::default().with_width(1.5).with_color(Color { a: 0.9, ..color }));
+        // The contrast handle: a dot on the curve.
+        let (_, (x, y)) = self.handles();
+        frame.fill(&Path::circle(at(x, y), 5.0), Color { a: 0.9, ..color });
     }
+}
+
+/// What lies between a square corner of the frame at `corner` and a round
+/// one of radius `r`; `sx` and `sy` (+1 or -1) point into the frame.
+fn corner_mask(corner: Point, sx: f32, sy: f32, r: f32) -> Path {
+    const STEPS: usize = 8;
+    let centre = Point::new(corner.x + sx * r, corner.y + sy * r);
+    Path::new(|builder| {
+        builder.move_to(corner);
+        for i in 0..=STEPS {
+            let a = i as f32 / STEPS as f32 * std::f32::consts::FRAC_PI_2;
+            builder.line_to(Point::new(
+                centre.x - sx * r * a.cos(),
+                centre.y - sy * r * a.sin(),
+            ));
+        }
+        builder.close();
+    })
 }
 
 fn draw_bins(frame: &mut Frame, histogram: &Histogram) {
@@ -391,42 +518,37 @@ fn draw_bins(frame: &mut Frame, histogram: &Histogram) {
         .unwrap_or(0)
         .max(1) as f32;
 
-    let colors = [
-        Color::from_rgba(1.0, 0.27, 0.23, 0.5),
-        Color::from_rgba(0.19, 0.82, 0.32, 0.5),
-        Color::from_rgba(0.04, 0.52, 1.0, 0.5),
-    ];
+    // The mixer's red, green and blue hues, as the sliders paint them but
+    // darker and more vivid, so the channels still read over the panel.
+    let channel = |hue: f32| {
+        let [r, g, b] = styling::ui_oklch(0.68, 0.17, hue);
+        Color::from_rgba(r, g, b, styling::TRACK_ALPHA)
+    };
+    let hue = |name: &str| {
+        let at = crate::color_edit::MIX_NAMES.iter().position(|n| *n == name);
+        crate::color_edit::MIX_HUES[at.unwrap_or(0)]
+    };
+    let colors = [channel(hue("Red")), channel(hue("Green")), channel(hue("Blue"))];
     for (i, bins) in histogram.bins.iter().enumerate() {
+        // Lines only: each channel's outline, then the luma's.
         let path = Path::new(|builder| {
-            let filled = i < colors.len();
-            if filled {
-                builder.move_to(Point::new(0.0, height));
-            }
             for (k, &count) in bins.iter().enumerate() {
                 let p = Point::new(
                     k as f32 / (BINS - 1) as f32 * width,
                     height * (1.0 - (count as f32 / peak).min(1.0)),
                 );
-                if filled || k > 0 {
+                if k > 0 {
                     builder.line_to(p)
                 } else {
                     builder.move_to(p)
                 }
             }
-            if filled {
-                builder.line_to(Point::new(width, height));
-                builder.close();
-            }
         });
-        match colors.get(i) {
-            Some(&color) => frame.fill(&path, color),
-            None => frame.stroke(
-                &path,
-                Stroke::default()
-                    .with_width(1.5)
-                    .with_color(Color::from_rgba(0.8, 0.8, 0.8, 0.9)),
-            ),
-        }
+        let color = match colors.get(i) {
+            Some(&color) => Color { a: 0.9, ..color },
+            None => styling::ADJUSTMENT_GRAY,
+        };
+        frame.stroke(&path, Stroke::default().with_width(1.5).with_color(color));
     }
 }
 

@@ -1,15 +1,29 @@
 [package]
 name = "starfish"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+# The newest minimum among the dependencies (ordered-float 1.90, rawler 1.89, wgpu 1.88).
+rust-version = "1.90"
+publish = false
 license = "MIT OR Apache-2.0"
 description = "Raw photo editor with GPU neural demosaicing and denoising"
 
 [workspace]
-members = ["wgpu-run", "web"]
+members = ["wgpu-run"]
+
+# RCD and Markesteijn, to compare the networks with: ports of darktable's
+# GPL-3 code (src/processing/gpl/), so a build with them is GPL-3 and they
+# are off unless asked for: `cargo build --features gpl-demosaic`.
+[features]
+gpl-demosaic = []
+# Embeds the networks (models/*_wgpu) in a debug-assertions build too, which
+# otherwise reads them from the source tree at run time: for a Debug-tab build
+# that runs on another machine (release builds always embed).
+embed-models = []
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
+half = "2"
 demosaic-run = { path = "wgpu-run" }
 iced = { version = "0.14", features = ["advanced", "canvas", "image", "tokio", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -28,8 +42,8 @@ wgpu = { version = "27", features = ["static-dxc"] }
 # Installers via cargo-packager (`cargo packager --release`, see README):
 # .app + .dmg on macOS, NSIS .exe installer on Windows, .deb + AppImage on
 # Linux, written to dist/. Each OS packages only its own formats, so CI builds
-# every platform on its own runner. Unsigned for now: no signingIdentity
-# (setting one also makes cargo-packager notarize).
+# every platform on its own runner. Only the macOS packages are signed and
+# notarized (see [package.metadata.packager.macos]); Windows and Linux are not.
 [package.metadata.packager]
 productName = "Starfish"
 # Reverse DNS of the owning GitHub account; needs no web page. Keep it
@@ -69,8 +83,13 @@ desktopTemplate = "resources/starfish.desktop"
 # Loaded at run time (dlopen), so not found by the dependency scan.
 depends = ["libvulkan1", "libxkbcommon0"]
 
-# Optimise dependencies in debug builds: raw decoding in an unoptimised
-# rawler is very slow. Our own crate stays at opt-level 0 for debugging.
+# Debug builds: our own crate at opt-level 1, as its CPU work (the lateral CA
+# measurement, lens/measure.rs) took ~1.5 s per develop unoptimised and ~0.2 s
+# at 1; debug assertions stay on (the Debug tab needs them).
+# Dependencies fully optimised: raw decoding in an unoptimised rawler is very slow.
+[profile.dev]
+opt-level = 1
+
 [profile.dev.package."*"]
 opt-level = 3
 # The demosaic runner cuts and places windows on the CPU, too slow unoptimised.

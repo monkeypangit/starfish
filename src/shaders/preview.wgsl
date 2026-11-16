@@ -33,6 +33,14 @@ struct View {
     // 1: every target pixel is the output pixel under its centre, sampled as
     // the export does, whatever the scale (the histogram's strided draw).
     point: u32,
+    // 1: draw clipped highlights black / clipped shadows white (the overlay).
+    clip_highlights: u32,
+    clip_shadows: u32,
+    // 1: tint pixels near the tone curve's crossover (the midpoint slider).
+    crossover: u32,
+    // 1: draw the rule-of-thirds grid over the frame (also pads lens to its
+    // 16-byte alignment).
+    grid_lines: u32,
     // Distortion and vignetting (develop.wgsl); an identity table if off.
     lens: Lens,
 }
@@ -86,73 +94,26 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
     return out;
 }
 
-// The crop-mode viewfinder (preview::Crop), drawn here per pixel in screen
-// pixels around the frame's centre. Sizes are fractions of the frame's short
-// side unless noted.
-// Radius of the split-image disc; the microprism collar is twice that.
-const SPLIT_RADIUS: f32 = 0.035;
-// How dark the halves get at their dark side, and how far across the disc
-// (0..1) the clear side stays clear before darkening starts.
-const SPLIT_DARKNESS: f32 = 0.25;
-const SPLIT_START: f32 = 0.15;
-// The microprism collar is a grid of small pyramids, each tilting the picture
-// towards one of its four faces: the cell size and the shift (fractions of
-// the frame's short side), how much the red and blue shift apart from green
-// (dispersion), and how much the faces' shading varies.
-const PRISM_CELL: f32 = 0.005;
-const PRISM_SHIFT: f32 = 0.002;
-const PRISM_DISPERSION: f32 = 0.05;
-const PRISM_SHADE: f32 = 0.05;
-// The split-image disc: each half shifts this far sideways (fraction of the
-// short side), the upper one to the right.
-const SPLIT_SHIFT: f32 = 0.0015;
+// The crop-mode frame, drawn here per pixel in screen pixels.
 // Brightness outside the frame, and the blur there: radius in screen pixels
 // far from the edge, and the distance over which it grows from the edge.
-const OUTSIDE_DIM: f32 = 0.1;
+const OUTSIDE_DIM: f32 = 0.2;
 const BLUR_RADIUS: f32 = 10.0;
 const BLUR_RAMP: f32 = 20.0;
 const BLUR_TAPS: i32 = 16;
-// Black shade inside the frame but outside the collar, and the vignette
-// strength at the corners.
-const SHADE_ALPHA: f32 = 0.0;
-const VIGNETTE: f32 = 0.8;
 // Line width in screen pixels, and each line's opacity (black, and the white
 // line beside it).
 const LINE_WIDTH: f32 = 1.0;
 const OUTLINE_ALPHA: f32 = 0.2;
-const RING_ALPHA: f32 = 0.2;
+// The composition grid's lines: opacity, as the outline's.
+const GRID_ALPHA: f32 = 0.35;
 
-// The face of the microprism pyramid under `p` (screen pixels from the
-// frame's centre): the unit step towards which it tilts the picture. The
-// pyramids sit on a grid turned 45 degrees, so they are diamonds on screen
-// and their faces point diagonally.
-fn prism_face(p: vec2<f32>, short: f32) -> vec2<f32> {
-    let turned = vec2<f32>(p.x - p.y, p.x + p.y) * 0.70710678;
-    let local = fract(turned / (PRISM_CELL * short)) * 2.0 - 1.0;
-    var face = vec2<f32>(0.0, sign(local.y));
-    if (abs(local.x) > abs(local.y)) {
-        face = vec2<f32>(sign(local.x), 0.0);
-    }
-    // Back to screen axes.
-    return vec2<f32>(face.x + face.y, face.y - face.x) * 0.70710678;
+fn fill_of(d: f32) -> f32 {
+    return clamp(0.5 - d, 0.0, 1.0);
 }
 
-// How the collar moves the picture at `frame`: xy is the shift in screen
-// pixels, z the dispersion (red goes 1 + z times as far, blue 1 - z). Zero
-// outside the collar.
-fn collar_shift(frame: vec2<f32>) -> vec3<f32> {
-    let size = view.frame_size * view.scale;
-    let short = min(size.x, size.y);
-    let p = (frame - view.frame_size * 0.5) * view.scale;
-    let r = length(p);
-    let disc = SPLIT_RADIUS * short;
-    if (r < disc) {
-        return vec3<f32>(select(-1.0, 1.0, p.y < 0.0) * SPLIT_SHIFT * short, 0.0, 0.0);
-    }
-    if (r < 2.0 * disc) {
-        return vec3<f32>(prism_face(p, short) * PRISM_SHIFT * short, PRISM_DISPERSION);
-    }
-    return vec3<f32>(0.0);
+fn line_of(d: f32) -> f32 {
+    return clamp(LINE_WIDTH * 0.5 + 0.5 - abs(d), 0.0, 1.0);
 }
 
 // `rgb` with a line along d = 0 (d is a signed distance in screen pixels,
@@ -162,54 +123,36 @@ fn outlined(rgb_in: vec3<f32>, d: f32, alpha: f32) -> vec3<f32> {
     return rgb * (1.0 - alpha * line_of(d));
 }
 
-// The display-encoded colour `rgb` at `frame` (frame space) with the
-// viewfinder over it: dimmed outside, then inside the frame the vignette, the
-// shade outside the collar, the prism facets, the split-image disc and the
-// lines. `edge` is the distance outside the frame in screen pixels.
-fn viewfinder(rgb_in: vec3<f32>, frame: vec2<f32>, edge: f32) -> vec3<f32> {
+// The display-encoded colour `rgb` with the frame's outline over it, and
+// everything outside the frame dimmed. `edge` is the distance outside the
+// frame in screen pixels.
+fn viewfinder(rgb_in: vec3<f32>, edge: f32) -> vec3<f32> {
+    let rgb = rgb_in * mix(OUTSIDE_DIM, 1.0, fill_of(edge));
+    return outlined(rgb, edge, OUTLINE_ALPHA);
+}
+
+// The rule-of-thirds grid over the frame at `frame` (frame space): two lines
+// each way, drawn black with a white line beside them like the outline.
+fn thirds(rgb_in: vec3<f32>, frame: vec2<f32>) -> vec3<f32> {
     var rgb = rgb_in;
     let size = view.frame_size * view.scale;
-    let short = min(size.x, size.y);
-    let p = (frame - view.frame_size * 0.5) * view.scale;
-    let r = length(p);
-    let disc = SPLIT_RADIUS * short;
-    let collar = 2.0 * disc;
-    let ring = size.x / 6.0;
-    let inside = fill_of(edge);
-
-    rgb = rgb * mix(OUTSIDE_DIM, 1.0, inside);
-
-    // Vignette: radial, 0 at the centre to VIGNETTE at the corners.
-    let corner_r = length(p / (size * 0.5)) * 0.70710678;
-    rgb = rgb * (1.0 - VIGNETTE * smoothstep(0.35, 1.0, corner_r) * inside);
-
-    // Shade between the collar and the frame's edge.
-    let in_collar = fill_of(r - collar);
-    rgb = rgb * (1.0 - SHADE_ALPHA * inside * (1.0 - in_collar));
-
-    // The pyramids' faces catch the light differently.
-    let face = prism_face(p, short);
-    let in_ring = in_collar * (1.0 - fill_of(r - disc));
-    rgb = rgb * (1.0 + PRISM_SHADE * dot(face, vec2<f32>(-0.6, -0.8)) * in_ring);
-
-    // Split-image disc, as when stopped down: the halves darken towards
-    // opposite sides (the upper one to the right).
-    let across = clamp((p.x / disc * 0.5 + 0.5 - SPLIT_START) / (1.0 - SPLIT_START), 0.0, 1.0);
-    let dark = select(1.0 - across, across, p.y < 0.0);
-    rgb = rgb * (1.0 - SPLIT_DARKNESS * dark * fill_of(r - disc));
-
-    // The split line across the disc.
-    rgb = rgb * (1.0 - RING_ALPHA * line_of(p.y) * fill_of(r - disc));
-
-    // Lines: the frame, the ground-glass ring, the collar and the disc, each
-    // black with a white line of the same width just inside it, so it reads
-    // against both bright and dark pictures.
-    rgb = outlined(rgb, edge, OUTLINE_ALPHA);
-    rgb = outlined(rgb, r - ring, RING_ALPHA);
-    rgb = outlined(rgb, r - collar, RING_ALPHA);
-    rgb = outlined(rgb, r - disc, RING_ALPHA);
+    let p = frame * view.scale;
+    for (var i = 1; i < 3; i++) {
+        let t = f32(i) / 3.0;
+        rgb = outlined(rgb, p.x - size.x * t, GRID_ALPHA);
+        rgb = outlined(rgb, p.y - size.y * t, GRID_ALPHA);
+    }
     return rgb;
 }
+
+// The linear values from which a channel counts as clipped: what rounds to
+// 255 and to 0 in 8-bit sRGB.
+const CLIP_HIGH: f32 = 0.9977;
+const CLIP_LOW: f32 = 0.00015;
+// The crossover overlay: half-width of the band around the midpoint, in
+// display-encoded values, and its tint (linear white).
+const CROSSOVER_BAND: f32 = 0.05;
+const CROSSOVER_TINT: vec3<f32> = vec3<f32>(0.5, 0.0, 1.0);
 
 // Whether `p`, in image pixels, is on the image.
 fn on_image(p: vec2<f32>) -> bool {
@@ -234,17 +177,9 @@ fn frame_sd(f: vec2<f32>) -> f32 {
 
 // Anti-aliased coverage of the inside (d < 0) of a shape and of a line along
 // d = 0, for a signed distance in screen pixels.
-fn fill_of(d: f32) -> f32 {
-    return clamp(0.5 - d, 0.0, 1.0);
-}
-
-fn line_of(d: f32) -> f32 {
-    return clamp(LINE_WIDTH * 0.5 + 0.5 - abs(d), 0.0, 1.0);
-}
-
 // The source at point `q` of the corrected image.
 fn sample_at(q: vec2<f32>, level: f32) -> vec3<f32> {
-    return sample_source(tex, samp, view.grid, lens_source(lens_lut, view.lens, q).xy, level);
+    return sample_lens(tex, samp, view.grid, lens_source(lens_lut, view.lens, q), level, view.edit.grain);
 }
 
 @fragment
@@ -256,7 +191,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let dp_dx = dpdx(here);
     let dp_dy = dpdy(here);
     let footprint = max(length(dp_dx), length(dp_dy));
-    let source = lens_source(lens_lut, view.lens, here).xy;
+    let source = lens_source(lens_lut, view.lens, here).green;
     let source_footprint = max(length(dpdx(source)), length(dpdy(source)));
 
     // Distance outside the frame in screen pixels (negative inside).
@@ -285,22 +220,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var cam = vec3<f32>(0.0);
     if (on_image(p)) {
         if (exact) {
-            cam = sample_source_cubic(tex, samp, view.grid, at.xy);
+            cam = sample_lens_cubic(tex, samp, view.grid, at, view.edit.grain);
         } else {
-            cam = sample_source(tex, samp, view.grid, at.xy, level);
-        }
-    }
-    if (view.shade != 0.0 && edge <= 0.0) {
-        // The collar and the split disc move the picture under them.
-        let shift = collar_shift(in.frame);
-        if (any(shift != vec3<f32>(0.0))) {
-            let red = shift.xy * (1.0 + shift.z);
-            let blue = shift.xy * (1.0 - shift.z);
-            cam = vec3<f32>(
-                sample_at(p + red.x * dp_dx + red.y * dp_dy, level).r,
-                sample_at(p + shift.x * dp_dx + shift.y * dp_dy, level).g,
-                sample_at(p + blue.x * dp_dx + blue.y * dp_dy, level).b,
-            );
+            cam = sample_lens(tex, samp, view.grid, at, level, view.edit.grain);
         }
     }
     if (edge > 0.0) {
@@ -321,17 +243,40 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
         cam = sum / f32(BLUR_TAPS + 1);
     }
-    cam = cam * at.z;
+    // Sharpening, inside the frame and the image only.
+    if (view.edit.sharpness != 0.0 && edge <= 0.0 && on_image(p)) {
+        cam = cam * sharpen(view.edit, tex, samp, view.grid, at, level, view.edit.sharpness);
+    }
+    cam = cam * at.gain;
     var base = 0.0;
     if (view.edit.local != 0.0) {
         base = textureSampleLevel(base_tex, base_samp, p / view.grid.size, 0.0).r;
     }
-    var rgb = develop(view.edit, cam, base);
+    // Where an image pixel is smaller than a target pixel, the grain of the
+    // many it covers averages out.
+    var rgb = develop(view.edit, cam, base, p, select(1.0 / max(footprint, 1.0), 1.0, exact));
+    // Clipping overlay, on the developed (clamped) value: a channel at white
+    // is a clipped highlight, one at black a clipped shadow.
+    if (edge <= 0.0 && on_image(p)) {
+        if (view.clip_highlights == 1u && any(rgb >= vec3<f32>(CLIP_HIGH))) {
+            rgb = vec3<f32>(0.0);
+        } else if (view.clip_shadows == 1u && any(rgb <= vec3<f32>(CLIP_LOW))) {
+            rgb = vec3<f32>(1.0);
+        }
+    }
+    // Crossover overlay: pixels whose tone curve input is near the midpoint.
+    if (view.crossover == 1u && edge <= 0.0 && on_image(p)) {
+        let near = 1.0 - smoothstep(0.0, CROSSOVER_BAND, abs(curve_input_luma - view.edit.curve.x));
+        rgb = mix(rgb, CROSSOVER_TINT, 0.1 * near);
+    }
     if (view.encode_srgb == 1u) {
         rgb = srgb_encode(rgb);
     }
+    if (view.grid_lines == 1u && edge <= 0.0) {
+        rgb = thirds(rgb, in.frame);
+    }
     if (view.shade != 0.0) {
-        rgb = viewfinder(rgb, in.frame, edge);
+        rgb = viewfinder(rgb, edge);
     }
     return vec4<f32>(rgb, 1.0);
 }

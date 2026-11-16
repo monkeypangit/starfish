@@ -3,7 +3,7 @@
 //! pixels, so a bicubic or mipmapped sample anywhere reads a single layer
 //! and shows no seams. Beyond the image the edge pixels repeat. Every layer
 //! has mipmaps. `develop.wgsl` (`Grid`, `sample_source`,
-//! `sample_source_cubic`) reads it; the preview, the export and the local
+//! `fetch_source_cubic`) reads it; the preview, the export and the local
 //! contrast overview share one upload.
 
 use std::sync::{Arc, Mutex};
@@ -58,9 +58,16 @@ impl Source {
     /// integrated GPU may not have twice over: the last upload is let go of
     /// first (callers drop theirs before asking for a new one), and running
     /// out of memory is an `Err` rather than an invalid texture.
-    pub fn get(device: &wgpu::Device, queue: &wgpu::Queue, image: &Image) -> Result<Arc<Source>, String> {
+    pub fn get(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: &Image,
+    ) -> Result<Arc<Source>, String> {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(source) = last.as_ref().filter(|s| s.image_id == image.id && s.device == *device) {
+        if let Some(source) = last
+            .as_ref()
+            .filter(|s| s.image_id == image.id && s.device == *device)
+        {
             return Ok(source.clone());
         }
         *last = None;
@@ -114,12 +121,20 @@ impl Source {
             for column in 0..columns {
                 let x0 = i64::from(column * step_x) - i64::from(OVERLAP);
                 let y0 = i64::from(row * step_y) - i64::from(OVERLAP);
-                write_layer(queue, &texture, row * columns + column, image, (x0, y0), (layer_w, layer_h));
+                write_layer(
+                    queue,
+                    &texture,
+                    row * columns + column,
+                    image,
+                    (x0, y0),
+                    (layer_w, layer_h),
+                );
             }
         }
         generate_mips(device, queue, &texture);
         // all mip levels: 4/3 of the first
-        let bytes = u64::from(layer_w * layer_h * columns * rows) * u64::from(BYTES_PER_PIXEL) * 4 / 3;
+        let bytes =
+            u64::from(layer_w * layer_h * columns * rows) * u64::from(BYTES_PER_PIXEL) * 4 / 3;
 
         Self {
             image_id: image.id,
@@ -208,7 +223,14 @@ fn write_layer(
                 pixels.extend_from_slice(&image.pixels[i..i + 4]);
             }
         }
-        write((xs.0, ys.0), bytemuck::cast_slice(&pixels), 0, w as u32 * BYTES_PER_PIXEL, w, h);
+        write(
+            (xs.0, ys.0),
+            bytemuck::cast_slice(&pixels),
+            0,
+            w as u32 * BYTES_PER_PIXEL,
+            w,
+            h,
+        );
     };
     band((x0, x1), (y0, iy0));
     band((x0, x1), (iy1, y1));
@@ -313,7 +335,15 @@ mod tests {
     #[test]
     fn grid_uniform_matches_the_shader() {
         let module = naga::front::wgsl::parse_str(crate::develop::SHADER).unwrap();
-        let grid = module.types.iter().find(|(_, t)| t.name.as_deref() == Some("Grid")).unwrap().1;
-        assert_eq!(grid.inner.size(module.to_ctx()) as usize, std::mem::size_of::<GridUniform>());
+        let grid = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("Grid"))
+            .unwrap()
+            .1;
+        assert_eq!(
+            grid.inner.size(module.to_ctx()) as usize,
+            std::mem::size_of::<GridUniform>()
+        );
     }
 }

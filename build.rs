@@ -1,4 +1,4 @@
-//! Embeds the neural demosaic exports (`training/*_wgpu/{f16,f32}/`) for
+//! Embeds the neural demosaic exports (`models/*_wgpu/{f16,f32}/`) for
 //! release builds: generates `models.rs` with `file(export, name)`, which
 //! `src/processing/neural.rs` loads them through. Debug builds read the
 //! exports from disk instead and ignore it. Windows builds also get the
@@ -14,14 +14,37 @@ const EXPORTS: &[&str] = &[
     "xtrans_wgpu/f32",
 ];
 
+/// The light and tiny networks for weaker GPUs: embedded when exported. While one is
+/// missing, any change under models/ reruns this, so a new export is
+/// picked up.
+const OPTIONAL: &[&str] = &[
+    "bayer_lite_wgpu/f16",
+    "bayer_lite_wgpu/f32",
+    "xtrans_lite_wgpu/f16",
+    "xtrans_lite_wgpu/f32",
+    "bayer_tiny_wgpu/f16",
+    "bayer_tiny_wgpu/f32",
+    "xtrans_tiny_wgpu/f16",
+    "xtrans_tiny_wgpu/f32",
+];
+
 fn main() {
-    let training = Path::new(env!("CARGO_MANIFEST_DIR")).join("training");
+    let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
     let mut arms = String::new();
-    for export in EXPORTS {
-        let dir = training.join(export);
+    let mut names = Vec::new();
+    let optional = OPTIONAL.iter().filter(|export| {
+        let found = models.join(export).is_dir();
+        if !found {
+            println!("cargo:rerun-if-changed={}", models.display());
+        }
+        found
+    });
+    for export in EXPORTS.iter().chain(optional) {
+        let dir = models.join(export);
         println!("cargo:rerun-if-changed={}", dir.display());
+        names.push(*export);
         let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("{}: {e}; run the export in training/", dir.display()))
+            .unwrap_or_else(|e| panic!("{}: {e}; sync the exports into models/ (scripts/sync-models.sh)", dir.display()))
             .map(|entry| entry.unwrap().path())
             .collect();
         files.sort();
@@ -36,7 +59,9 @@ fn main() {
         }
     }
     let code = format!(
-        "/// An embedded export file: `export` like \"xtrans_wgpu/f16\", `name` like \"graph.txt\".\n\
+        "/// The embedded exports, like \"xtrans_wgpu/f16\".\n\
+         pub const EXPORTS: &[&str] = &{names:?};\n\
+         /// An embedded export file: `export` like \"xtrans_wgpu/f16\", `name` like \"graph.txt\".\n\
          pub fn file(export: &str, name: &str) -> Option<&'static [u8]> {{\n    \
              match (export, name) {{\n{arms}        _ => None,\n    }}\n}}\n"
     );

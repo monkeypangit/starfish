@@ -11,6 +11,7 @@ use wgpu::util::DeviceExt as _;
 use std::sync::atomic::AtomicBool;
 
 use super::{Demosaic, Gpu, IMAGE_FORMAT, Noise, texture_desc};
+use crate::lens::Measured;
 use crate::raw::{MAX_CFA_SIZE, RawFrame, SensorKind};
 
 const WORKGROUP_SIZE: u32 = 8;
@@ -118,7 +119,7 @@ impl Demosaic for BinningDemosaic {
         raw: &RawFrame,
         _noise: Option<Noise>,
         _cancel: &AtomicBool,
-    ) -> Result<(wgpu::Texture, Option<Noise>), String> {
+    ) -> Result<(wgpu::Texture, Option<Noise>, Option<Measured>), String> {
         let bin = match raw.cfa.kind() {
             SensorKind::Bayer => 2,
             SensorKind::XTrans => 3,
@@ -226,7 +227,7 @@ impl Demosaic for BinningDemosaic {
         }
         queue.submit([encoder.finish()]);
 
-        Ok((output, None))
+        Ok((output, None, None))
     }
 }
 

@@ -5,27 +5,127 @@
 //! defaults (8192 px textures), which is smaller than many sensors.
 //!
 //! Pipeline: [`RawFrame`] → [`Demosaic`] → full-resolution `Rgba16Float`
-//! texture (white-balanced camera RGB) → lens correction, if the file has a
-//! profile (the app asks for CA only; distortion and vignetting are applied
-//! where the image is drawn) → read back into an [`Image`].
+//! texture (white-balanced camera RGB) → lens correction, if asked for and
+//! the file has a profile (the app asks for none: every correction is drawn
+//! where the image is, see [`Image::profile`]) → read back into an
+//! [`Image`], whose lateral CA is then measured (`lens::measure`).
 //!
 //! The demosaic stage is the neural joint demosaic + denoise
 //! ([`NeuralDemosaic`]); `STARFISH_DEMOSAIC=binning` selects the fast binning
-//! one instead.
+//! one instead. [`Method`] picks between the network, the light and tiny
+//! networks for weaker GPUs and the binning stage per develop.
 
 mod binning;
+mod ca_fix;
+#[cfg(feature = "gpl-demosaic")]
+mod gpl;
+mod highlights;
+pub mod hot_pixels;
 mod lens;
+mod mosaic;
 mod neural;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use crate::lens::{Corrections, LensCorrection};
+use crate::lens::{Corrections, LensCorrection, Measured};
 use crate::raw::{RawFrame, SensorKind, WhiteBalance};
 
 pub use binning::BinningDemosaic;
+#[cfg(feature = "gpl-demosaic")]
+use gpl::{Reference, ReferenceDemosaic};
 use lens::LensPass;
-pub use neural::NeuralDemosaic;
+use mosaic::MosaicDemosaic;
+pub use neural::{NeuralDemosaic, variants};
+
+/// Debugging: whether the networks' output alpha, the grain the grain slider
+/// adds back, is the mean of the middle 5 of the 3x3 grains around each pixel
+/// instead of its own (`RawInput::filter_grain`), for every develop from now
+/// on. Process-wide so it need not pass through every stage;
+/// `Image::filter_grain` records what a develop used. On by default.
+static FILTER_GRAIN: AtomicBool = AtomicBool::new(true);
+
+pub fn set_filter_grain(on: bool) {
+    FILTER_GRAIN.store(on, Ordering::Relaxed);
+}
+
+pub fn filter_grain() -> bool {
+    FILTER_GRAIN.load(Ordering::Relaxed)
+}
+
+/// Debugging: whether a network gets a mosaic with the lateral CA taken out
+/// first (`ca_fix`, the mosaic's measured
+/// CA; then nothing is drawn) instead of having it measured in its output
+/// and drawn, for every develop from now on; `Image::ca_fix`. On by default.
+static CA_FIX: AtomicBool = AtomicBool::new(true);
+
+pub fn set_ca_fix(on: bool) {
+    CA_FIX.store(on, Ordering::Relaxed);
+}
+
+pub fn ca_fix() -> bool {
+    CA_FIX.load(Ordering::Relaxed)
+}
+
+/// Whether the hot and dead pixels of the mosaic are replaced by their
+/// neighbours' median (`hot_pixels`) before anything else, for every develop
+/// from now on; `Image::hot_pixel_fix`. On by default.
+static HOT_PIXELS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_hot_pixels(on: bool) {
+    HOT_PIXELS.store(on, Ordering::Relaxed);
+}
+
+pub fn hot_pixels_fix() -> bool {
+    HOT_PIXELS.load(Ordering::Relaxed)
+}
+
+/// The sites the user picked as defective in the open file, `(y, x)` in the
+/// raw frame, and a number that changes with every set, which an [`Image`]
+/// records so a re-develop knows it is out of date. They are replaced with
+/// the automatic ones, if [`hot_pixels_fix`] is on.
+static PICKED: Mutex<(u64, Vec<(usize, usize)>)> = Mutex::new((0, Vec::new()));
+
+pub fn set_picked(sites: Vec<(usize, usize)>) {
+    let mut picked = PICKED.lock().unwrap_or_else(PoisonError::into_inner);
+    *picked = (picked.0 + 1, sites);
+}
+
+pub fn picked() -> (u64, Vec<(usize, usize)>) {
+    PICKED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Debugging: the clipped samples of the mosaic are rebuilt from the
+/// unclipped ones (`highlights`), before the CA is taken out (see
+/// [`highlights_first`]) and before the demosaic, for every develop from now on; `Image::highlights`. Off by default.
+static HIGHLIGHTS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_highlights(on: bool) {
+    HIGHLIGHTS.store(on, Ordering::Relaxed);
+}
+
+pub fn highlights() -> bool {
+    HIGHLIGHTS.load(Ordering::Relaxed)
+}
+
+/// With the CA taken out of the mosaic and the highlights rebuilt, the
+/// rebuilding runs first, on the mosaic with its CA (each colour read where
+/// it saw the same scene point, `highlights::reconstruct`'s `ca`), and `CaFix`
+/// gets the result; `STARFISH_HIGHLIGHTS_AFTER_CA=1` gives the old order
+/// (the CA out first, then the highlights) to compare.
+pub fn highlights_first() -> bool {
+    static FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIRST.get_or_init(|| std::env::var_os("STARFISH_HIGHLIGHTS_AFTER_CA").is_none())
+}
+
+/// Raw samples (white = 1, not balanced) at or above this count as clipped,
+/// everywhere in the app: the highlight reconstruction, the CA fix's fallback
+/// and its measurement. (wgpu-run's grain test has its own
+/// copy, `wgpu-run/src/lib.rs`'s `CLIPPED`.)
+pub const CLIPPED: f32 = 0.98;
 
 /// Format produced by every demosaic stage.
 pub const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -141,17 +241,6 @@ pub struct Noise {
     pub b: f64,
 }
 
-impl Noise {
-    /// The same noise with sigma multiplied by `factor`.
-    pub fn scaled(self, factor: f64) -> Self {
-        let variance = factor * factor;
-        Self {
-            a: self.a * variance,
-            b: self.b * variance,
-        }
-    }
-}
-
 /// A demosaic stage: turns a sensor mosaic into a full-resolution RGB image.
 ///
 /// Implementations must return a texture of [`IMAGE_FORMAT`] with the same
@@ -163,13 +252,15 @@ pub const CANCELLED: &str = "Cancelled";
 
 pub trait Demosaic: Send + Sync {
     fn name(&self) -> &str;
+    /// The demosaiced image, the noise it denoised for and the lateral CA
+    /// taken out of its mosaic, if it was (`CaFix`).
     fn run(
         &self,
         gpu: &Gpu,
         raw: &RawFrame,
         noise: Option<Noise>,
         cancel: &AtomicBool,
-    ) -> Result<(wgpu::Texture, Option<Noise>), String>;
+    ) -> Result<(wgpu::Texture, Option<Noise>, Option<Measured>), String>;
 
     /// The noise this stage estimates in `raw`, `None` if it doesn't denoise.
     fn estimate_noise(&self, _gpu: &Gpu, _raw: &RawFrame) -> Result<Option<Noise>, String> {
@@ -181,12 +272,100 @@ pub trait Demosaic: Send + Sync {
     fn unload(&self) {}
 }
 
+/// Which demosaic stage develops an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// A network exported under `models/`: the variant is what sits between
+    /// the sensor and `_wgpu` in the folder's name (`""` for
+    /// `models/{bayer,xtrans}_wgpu/`, `"_lite"` for `*_lite_wgpu/`), as
+    /// [`variants`] found it.
+    Network(&'static str),
+    /// The fast binning stage, without a network (a debugging aid).
+    Quick,
+    /// The raw mosaic itself, CA taken out of it if [`set_ca_fix`] is on (a
+    /// debugging aid).
+    Mosaic,
+    /// A reference demosaic to compare the networks with: RCD (Bayer) or
+    /// Markesteijn 3-pass (X-Trans), see `gpl/`.
+    #[cfg(feature = "gpl-demosaic")]
+    Reference(Reference),
+}
+
+impl Method {
+    /// The reference demosaics for `kind`'s files (every sensor's before one is open).
+    #[cfg(feature = "gpl-demosaic")]
+    fn references(kind: Option<SensorKind>) -> impl Iterator<Item = Method> {
+        [Reference::Rcd, Reference::Markesteijn]
+            .into_iter()
+            .filter(move |reference| kind.is_none_or(|kind| kind == reference.sensor()))
+            .map(Method::Reference)
+    }
+
+    #[cfg(not(feature = "gpl-demosaic"))]
+    fn references(_: Option<SensorKind>) -> impl Iterator<Item = Method> {
+        std::iter::empty()
+    }
+
+    /// Whether the stage denoises, so there is a noise to fit and set.
+    pub fn denoises(self) -> bool {
+        matches!(self, Method::Network(_))
+    }
+
+    /// The full network.
+    pub const NEURAL: Method = Method::Network("");
+    /// The network at half the width, for weaker GPUs.
+    const LIGHT: &'static str = "_lite";
+
+    /// What the picker offers for `kind`'s files (every sensor's before one
+    /// is open): the exported networks, then the quick stage.
+    pub fn available(kind: Option<SensorKind>) -> Vec<Method> {
+        let mut variants: Vec<&'static str> = match kind {
+            Some(kind) => variants(kind).to_vec(),
+            None => [SensorKind::Bayer, SensorKind::XTrans]
+                .into_iter()
+                .flat_map(|kind| variants(kind).iter().copied())
+                .collect(),
+        };
+        variants.sort_unstable();
+        variants.dedup();
+        variants
+            .into_iter()
+            .map(Method::Network)
+            .chain([Method::Quick, Method::Mosaic])
+            .chain(Method::references(kind))
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Method::Network("") => f.write_str("Neural network"),
+            Method::Network("_lite") => f.write_str("Light network"),
+            Method::Network("_tiny") => f.write_str("Tiny network"),
+            Method::Network(variant) => f.write_str(variant.trim_start_matches('_')),
+            Method::Quick => f.write_str("Quick"),
+            Method::Mosaic => f.write_str("Mosaic"),
+            #[cfg(feature = "gpl-demosaic")]
+            Method::Reference(Reference::Rcd) => f.write_str("RCD"),
+            #[cfg(feature = "gpl-demosaic")]
+            Method::Reference(Reference::Markesteijn) => f.write_str("Markesteijn 3-pass"),
+        }
+    }
+}
+
 pub struct Engine {
     gpu: Gpu,
-    bayer: Box<dyn Demosaic>,
-    xtrans: Box<dyn Demosaic>,
+    /// Each sensor's networks by [`variants`] name.
+    bayer: Vec<(&'static str, Box<dyn Demosaic>)>,
+    xtrans: Vec<(&'static str, Box<dyn Demosaic>)>,
     /// Quick low-quality stage, shown while the real one runs.
     preview: BinningDemosaic,
+    mosaic: MosaicDemosaic,
+    #[cfg(feature = "gpl-demosaic")]
+    rcd: ReferenceDemosaic,
+    #[cfg(feature = "gpl-demosaic")]
+    markesteijn: ReferenceDemosaic,
     lens: LensPass,
 }
 
@@ -194,24 +373,34 @@ impl Engine {
     fn new() -> Result<Self, String> {
         let gpu = Gpu::new()?;
         crate::log::write(&format!("GPU: {}", gpu.summary()));
-        let (bayer, xtrans): (Box<dyn Demosaic>, Box<dyn Demosaic>) =
-            if std::env::var("STARFISH_DEMOSAIC").is_ok_and(|v| v == "binning") {
-                let binning = || Box::new(BinningDemosaic::new(&gpu.device));
-                (binning(), binning())
-            } else {
-                let f16 = gpu.device.features().contains(wgpu::Features::SHADER_F16);
-                (
-                    Box::new(NeuralDemosaic::new(SensorKind::Bayer, f16)),
-                    Box::new(NeuralDemosaic::new(SensorKind::XTrans, f16)),
-                )
-            };
+        let binning = std::env::var("STARFISH_DEMOSAIC").is_ok_and(|v| v == "binning");
+        let f16 = gpu.device.features().contains(wgpu::Features::SHADER_F16);
+        let stages = |kind| {
+            variants(kind)
+                .iter()
+                .map(|&variant| -> (&'static str, Box<dyn Demosaic>) {
+                    if binning {
+                        (variant, Box::new(BinningDemosaic::new(&gpu.device)))
+                    } else {
+                        (variant, Box::new(NeuralDemosaic::new(kind, variant, f16)))
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let (bayer, xtrans) = (stages(SensorKind::Bayer), stages(SensorKind::XTrans));
         let preview = BinningDemosaic::new(&gpu.device);
+        let mosaic = MosaicDemosaic::new(&gpu.device);
         let lens = LensPass::new(&gpu.device);
         Ok(Self {
             gpu,
             bayer,
             xtrans,
             preview,
+            mosaic,
+            #[cfg(feature = "gpl-demosaic")]
+            rcd: ReferenceDemosaic::new(Reference::Rcd),
+            #[cfg(feature = "gpl-demosaic")]
+            markesteijn: ReferenceDemosaic::new(Reference::Markesteijn),
             lens,
         })
     }
@@ -230,23 +419,65 @@ impl Engine {
         self.gpu.summary()
     }
 
-    /// The demosaic stage for `raw`'s sensor.
-    fn stage(&self, raw: &RawFrame) -> Result<&dyn Demosaic, String> {
-        match raw.cfa.kind() {
-            SensorKind::Bayer => Ok(&*self.bayer),
-            SensorKind::XTrans => Ok(&*self.xtrans),
-            SensorKind::Other => Err(format!(
-                "This sensor is not supported yet: Starfish handles Bayer and \
-                 X-Trans sensors, and this file has a {}×{} colour filter pattern",
-                raw.cfa.width, raw.cfa.height
-            )),
+    /// The method to use when none is chosen: the light network on an
+    /// integrated (or software) GPU if `raw`'s sensor has one, else the
+    /// full one.
+    pub fn automatic(&self, raw: &RawFrame) -> Method {
+        match self.gpu.info.device_type {
+            wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
+                if variants(raw.cfa.kind()).contains(&Method::LIGHT) =>
+            {
+                Method::Network(Method::LIGHT)
+            }
+            _ => Method::NEURAL,
         }
     }
 
-    /// The noise the demosaic stage estimates in `raw`, `None` if it doesn't
-    /// denoise.
-    pub fn estimate_noise(&self, raw: &RawFrame) -> Result<Option<Noise>, String> {
-        let stage = self.stage(raw)?;
+    /// The demosaic stage `method` uses for `raw`'s sensor. Choosing one
+    /// network lets go of the others' GPU buffers, so no two are loaded at
+    /// once.
+    fn stage(&self, raw: &RawFrame, method: Method) -> Result<&dyn Demosaic, String> {
+        let kind = raw.cfa.kind();
+        let networks = match kind {
+            SensorKind::Bayer => &self.bayer,
+            SensorKind::XTrans => &self.xtrans,
+            SensorKind::Other => {
+                return Err(format!(
+                    "This sensor is not supported yet: Starfish handles Bayer and \
+                 X-Trans sensors, and this file has a {}×{} colour filter pattern",
+                    raw.cfa.width, raw.cfa.height
+                ));
+            }
+        };
+        let wanted = match method {
+            Method::Network(wanted) => wanted,
+            Method::Quick => return Ok(&self.preview),
+            Method::Mosaic => return Ok(&self.mosaic),
+            #[cfg(feature = "gpl-demosaic")]
+            Method::Reference(Reference::Rcd) => return Ok(&self.rcd),
+            #[cfg(feature = "gpl-demosaic")]
+            Method::Reference(Reference::Markesteijn) => return Ok(&self.markesteijn),
+        };
+        let mut chosen = None;
+        for (variant, stage) in networks {
+            if *variant == wanted {
+                chosen = Some(&**stage);
+            } else {
+                stage.unload();
+            }
+        }
+        chosen.ok_or_else(|| {
+            format!(
+                "No {} export for {kind} sensors",
+                neural::export_name(kind, wanted)
+            )
+        })
+    }
+
+    /// The noise `method`'s demosaic stage estimates in `raw`, `None` if it
+    /// doesn't denoise.
+    pub fn estimate_noise(&self, raw: &RawFrame, method: Method) -> Result<Option<Noise>, String> {
+        let stage = self.stage(raw, method)?;
         self.checked(raw, || stage.estimate_noise(&self.gpu, raw))
     }
 
@@ -262,13 +493,14 @@ impl Engine {
         let error = self.gpu.take_error();
         if error.is_some() {
             // A model loaded during the failure may hold invalid buffers.
-            self.bayer.unload();
-            self.xtrans.unload();
+            for (_, stage) in self.bayer.iter().chain(&self.xtrans) {
+                stage.unload();
+            }
         }
         match error {
             Some(error) if error.starts_with("Out of GPU memory") => Err(format!(
                 "Out of GPU memory: this {:.0} MP image needs more video memory than \
-                 is free. Close other GPU-heavy programs, or turn on \"Quick demosaic\" under Debug.",
+                 is free. Close other GPU-heavy programs, or set Debug → Demosaic to \"Quick\".",
                 (raw.width * raw.height) as f64 / 1e6
             )),
             Some(error) => Err(format!("GPU error: {error}")),
@@ -278,36 +510,46 @@ impl Engine {
 
     /// Demosaics `raw` and reads the result back to the CPU. `noise`
     /// overrides the demosaic stage's own noise estimate. `lens` picks the
-    /// corrections of the file's lens profile to apply, if it has one. `quick`
-    /// uses the fast binning stage instead of the neural one (a debugging aid).
-    /// Setting `cancel` stops the run early with [`CANCELLED`].
+    /// corrections of the file's lens profile to apply, if it has one.
+    /// `method` picks the demosaic stage. Setting `cancel` stops the run early
+    /// with [`CANCELLED`].
     pub fn develop(
         &self,
         raw: &RawFrame,
         noise: Option<Noise>,
         lens: Corrections,
-        quick: bool,
+        method: Method,
         cancel: &AtomicBool,
     ) -> Result<Image, String> {
-        let stage = self.stage(raw)?;
-        let stage = if quick { &self.preview } else { stage };
-        self.develop_with(stage, raw, noise, lens, quick, cancel)
+        let stage = self.stage(raw, method)?;
+        self.develop_with(stage, raw, noise, lens, method, true, cancel)
     }
 
     /// Like [`Engine::develop`] with the fast binning stage: a rough
-    /// full-size image in a fraction of the time.
+    /// full-size image in a fraction of the time. Its lateral CA is not
+    /// measured, so it has no CA correction.
     pub fn develop_preview(&self, raw: &RawFrame, lens: Corrections) -> Result<Image, String> {
-        self.stage(raw)?;
-        self.develop_with(&self.preview, raw, None, lens, true, &AtomicBool::new(false))
+        let stage = self.stage(raw, Method::Quick)?;
+        self.develop_with(
+            stage,
+            raw,
+            None,
+            lens,
+            Method::Quick,
+            false,
+            &AtomicBool::new(false),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn develop_with(
         &self,
         stage: &dyn Demosaic,
         raw: &RawFrame,
         noise: Option<Noise>,
         lens: Corrections,
-        quick: bool,
+        method: Method,
+        measure: bool,
         cancel: &AtomicBool,
     ) -> Result<Image, String> {
         let limit = self.gpu.device.limits().max_texture_dimension_2d as usize;
@@ -319,22 +561,65 @@ impl Engine {
         }
 
         self.checked(raw, || {
-            self.develop_unchecked(stage, raw, noise, lens, quick, cancel)
+            self.develop_unchecked(stage, raw, noise, lens, method, measure, cancel)
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn develop_unchecked(
         &self,
         stage: &dyn Demosaic,
         raw: &RawFrame,
         noise: Option<Noise>,
         lens: Corrections,
-        quick: bool,
+        method: Method,
+        measure: bool,
         cancel: &AtomicBool,
     ) -> Result<Image, String> {
         let kind = raw.cfa.kind();
         let start = std::time::Instant::now();
-        let (texture, noise) = stage.run(&self.gpu, raw, noise, cancel)?;
+        let filter_grain = filter_grain();
+        let ca_fix = ca_fix();
+        let highlights = highlights();
+        let hot_pixel_fix = hot_pixels_fix();
+        // the stages read `raw.data`, so they get a copy with the defects
+        // replaced (found ones and picked ones); the lateral CA is measured
+        // on the original first, once
+        let (picked_version, picks) = picked();
+        let cleaned;
+        let mut hot_pixels = None;
+        let mut picked_count = 0;
+        let raw = if hot_pixel_fix {
+            let mut all = raw.hot_pixels().to_vec();
+            let manual =
+                hot_pixels::replacements(&raw.data, raw.width, raw.height, &raw.cfa, &picks);
+            picked_count = manual.len();
+            for (i, v) in manual {
+                match all.binary_search_by_key(&i, |f| f.0) {
+                    Ok(k) => all[k].1 = v,
+                    Err(k) => all.insert(k, (i, v)),
+                }
+            }
+            hot_pixels = Some(all.len());
+            if all.is_empty() {
+                raw
+            } else {
+                crate::log::write(&format!(
+                    "hot and dead pixels: {} replaced ({picked_count} picked)",
+                    all.len()
+                ));
+                let _ = raw.mosaic_ca();
+                let mut copy = raw.clone();
+                for (i, v) in all {
+                    copy.data[i] = v;
+                }
+                cleaned = copy;
+                &cleaned
+            }
+        } else {
+            raw
+        };
+        let (texture, noise, corrected_ca) = stage.run(&self.gpu, raw, noise, cancel)?;
         let applied = raw
             .lens
             .as_ref()
@@ -345,6 +630,14 @@ impl Engine {
         };
         let queued = start.elapsed();
         let pixels = read_back(&self.gpu, &texture)?;
+        // In what the stage made, unless the CA was taken out of its mosaic.
+        // The networks remove part of it on their own, so it is measured
+        // after them.
+        let ca = if measure && corrected_ca.is_none() && method != Method::Mosaic {
+            crate::lens::measure(texture.width(), texture.height(), &pixels)
+        } else {
+            None
+        };
         crate::log::write(&format!(
             "{}: {}×{} developed in {} ms (read back from {} ms on)",
             stage.name(),
@@ -366,13 +659,26 @@ impl Engine {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            camera: raw.camera.clone(),
             sensor: kind,
             demosaic: stage.name().to_owned(),
             noise,
-            lens: applied,
-            profile: raw.lens.clone().map(Arc::new),
-            quick,
+            profile: LensCorrection::drawn(
+                raw.lens.as_ref(),
+                ca.as_ref(),
+                texture.width(),
+                texture.height(),
+            )
+            .map(Arc::new),
+            ca,
+            corrected_ca,
+            method,
+            filter_grain,
+            ca_fix,
+            highlights,
+            hot_pixel_fix,
+            hot_pixels,
+            picked_version,
+            picked: picked_count,
         })
     }
 }
@@ -411,18 +717,63 @@ pub struct Image {
     pub cam_to_srgb: [[f32; 3]; 3],
     pub white: Option<WhiteBalance>,
     pub name: String,
-    pub camera: String,
     pub sensor: SensorKind,
     pub demosaic: String,
     /// What the demosaic stage denoised for, if it denoises.
     pub noise: Option<Noise>,
-    /// The lens corrections that have been applied (the app asks for CA
-    /// only; distortion and vignetting are applied where it is drawn).
-    pub lens: Corrections,
-    /// The raw file's lens profile, for the corrections applied when drawing.
+    /// The lens profile for the corrections applied when drawing: the raw
+    /// file's distortion and vignetting and the measured CA
+    /// ([`LensCorrection::drawn`]).
     pub profile: Option<Arc<LensCorrection>>,
-    /// Made by the quick binning stage rather than the neural one.
-    pub quick: bool,
+    /// The lateral CA measured in it, if it could be, which is drawn.
+    pub ca: Option<Measured>,
+    /// The lateral CA taken out of the mosaic before the demosaic (the
+    /// mosaic's, see [`set_ca_fix`]); then `ca` is not measured.
+    pub corrected_ca: Option<Measured>,
+    /// The demosaic stage that made it.
+    pub method: Method,
+    /// Whether its alpha holds the filtered grain (see [`set_filter_grain`]).
+    pub filter_grain: bool,
+    /// Whether the CA was to be taken out of the mosaic (see [`set_ca_fix`]).
+    pub ca_fix: bool,
+    /// Whether the clipped samples of the mosaic were rebuilt (see [`set_highlights`]).
+    pub highlights: bool,
+    /// Whether the hot and dead pixels were to be replaced (see [`set_hot_pixels`]).
+    pub hot_pixel_fix: bool,
+    /// How many were replaced; `None` if the switch was off.
+    pub hot_pixels: Option<usize>,
+    /// The [`set_picked`] version it was made with, and how many of the
+    /// picked sites it replaced.
+    pub picked_version: u64,
+    pub picked: usize,
+}
+
+impl Image {
+    /// The raw mosaic of `raw` as an image to pick defective sites in: each
+    /// site's white balanced sample in its own colour's channel, the others
+    /// 0, with no defect removed, CA fix or lens profile. Same size as `raw`,
+    /// so a pixel here is the same site there.
+    pub fn raw_view(&self, raw: &RawFrame) -> Image {
+        use half::f16;
+        let mut pixels = vec![0u16; raw.width * raw.height * 4];
+        for (i, &v) in raw.data.iter().enumerate() {
+            let (y, x) = (i / raw.width, i % raw.width);
+            let c =
+                raw.cfa.colors[(y % raw.cfa.height) * raw.cfa.width + x % raw.cfa.width] as usize;
+            pixels[i * 4 + c] = f16::from_f32(v * raw.wb[c]).to_bits();
+        }
+        Image {
+            id: next_image_id(),
+            pixels: Arc::new(pixels),
+            noise: None,
+            profile: None,
+            ca: None,
+            corrected_ca: None,
+            method: Method::Mosaic,
+            demosaic: String::from("Raw mosaic"),
+            ..self.clone()
+        }
+    }
 }
 
 impl std::fmt::Debug for Image {
@@ -439,6 +790,57 @@ impl std::fmt::Debug for Image {
 fn next_image_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Copies an `R32Float` texture to CPU memory.
+fn read_back_f32(gpu: &Gpu, texture: &wgpu::Texture) -> Result<Vec<f32>, String> {
+    let (width, height) = (texture.width(), texture.height());
+    let padded_row_bytes = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: padded_row_bytes as u64 * height as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row_bytes),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| format!("GPU poll failed: {e:?}"))?;
+    rx.recv()
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Readback failed: {e}"))?;
+    let mapped = slice.get_mapped_range();
+    let mut out = Vec::with_capacity((width * height) as usize);
+    for row in mapped.chunks_exact(padded_row_bytes as usize) {
+        out.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&row[..width as usize * 4]));
+    }
+    drop(mapped);
+    staging.unmap();
+    Ok(out)
 }
 
 /// Copies an `Rgba16Float` texture to CPU memory, in bands of rows so no
@@ -511,7 +913,6 @@ fn read_back(gpu: &Gpu, texture: &wgpu::Texture) -> Result<Vec<u16>, String> {
     Ok(out)
 }
 
-#[cfg(test)]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((bits >> 10) & 0x1f) as i32;
@@ -529,12 +930,14 @@ mod tests {
 
     /// Develops `STARFISH_TEST_RAW` and writes a downscaled sRGB preview to
     /// `STARFISH_TEST_OUT` (PPM). `STARFISH_TEST_LENS=0` skips the file's lens
-    /// correction; `STARFISH_TEST_QUICK=1` uses the quick binning stage;
+    /// correction; `STARFISH_TEST_QUICK=1` uses the quick binning stage,
+    /// `STARFISH_TEST_MOSAIC=1` the mosaic itself,
+    /// `STARFISH_TEST_MODEL=_lite` the network exported as `*_lite_wgpu`;
     /// `STARFISH_TEST_DUMP` writes the full image as planar f32
     /// camera RGB. The image (PPM, dump) has all the lens corrections from
-    /// `LensPass`; the export (`STARFISH_TEST_EXPORT`) is developed again
-    /// as the app does it, CA only, with distortion and vignetting drawn,
-    /// and its histogram computed.
+    /// `LensPass`, CA from the file's table; the export (`STARFISH_TEST_EXPORT`)
+    /// is developed again as the app does it, with every correction drawn
+    /// and CA as measured, and its histogram computed.
     /// Run with:
     /// `STARFISH_TEST_RAW=file.raf STARFISH_TEST_OUT=out.ppm cargo test -- --ignored --nocapture`
     #[test]
@@ -554,18 +957,61 @@ mod tests {
             Ok("0") => Corrections::NONE,
             _ => Corrections::ALL,
         };
-        let quick = std::env::var("STARFISH_TEST_QUICK").is_ok_and(|v| v != "0");
-        let image = Engine::get()
-            .unwrap()
-            .develop(&raw, None, lens, quick, &AtomicBool::new(false))
+        let set = |var| std::env::var(var).is_ok_and(|v| v != "0");
+        // `STARFISH_TEST_GRAIN_FILTER=1`: the grain's 3x3 middle-5 mean
+        set_filter_grain(set("STARFISH_TEST_GRAIN_FILTER"));
+        // `STARFISH_TEST_CA_FIX=0`: the CA drawn, not taken out of the mosaic
+        set_ca_fix(std::env::var("STARFISH_TEST_CA_FIX").as_deref() != Ok("0"));
+        // `STARFISH_TEST_HIGHLIGHTS=1`: the clipped samples of the mosaic rebuilt
+        set_highlights(set("STARFISH_TEST_HIGHLIGHTS"));
+        // `STARFISH_TEST_HOT_PIXELS=0`: the hot and dead pixels left in
+        set_hot_pixels(std::env::var("STARFISH_TEST_HOT_PIXELS").as_deref() != Ok("0"));
+        let method = if set("STARFISH_TEST_QUICK") {
+            Method::Quick
+        } else if set("STARFISH_TEST_MOSAIC") {
+            Method::Mosaic
+        } else if cfg!(feature = "gpl-demosaic") && set("STARFISH_TEST_REFERENCE") {
+            Method::available(Some(raw.cfa.kind()))
+                .into_iter()
+                .find(|method| {
+                    !matches!(method, Method::Network(_) | Method::Quick | Method::Mosaic)
+                })
+                .expect("no reference demosaic for this sensor")
+        } else if let Ok(model) = std::env::var("STARFISH_TEST_MODEL") {
+            let variant = variants(raw.cfa.kind())
+                .iter()
+                .find(|variant| **variant == model)
+                .unwrap_or_else(|| panic!("no {model} export for this sensor"));
+            Method::Network(variant)
+        } else {
+            Method::NEURAL
+        };
+        let engine = Engine::get().unwrap();
+        let noise = engine.estimate_noise(&raw, method).unwrap();
+        let start = std::time::Instant::now();
+        let image = engine
+            .develop(&raw, noise, lens, method, &AtomicBool::new(false))
             .unwrap();
         println!(
-            "demosaic: {} (quick: {})\nlens profile: {:?}, applied: {:?}",
-            image.demosaic,
-            image.quick,
-            raw.lens.as_ref().map(|l| l.description()),
-            image.lens
+            "develop: {} ms (the noise fitted before)",
+            start.elapsed().as_millis()
         );
+        println!(
+            "demosaic: {} ({:?})\nlens profile: {:?}, CA measured after LensPass: {:?}",
+            image.demosaic,
+            image.method,
+            raw.lens.as_ref().map(|l| l.description()),
+            image.ca.map(|ca| ca.summary())
+        );
+        // `STARFISH_TEST_GRAIN_DUMP`: the alpha, the grain, as f32
+        if let Ok(dump) = std::env::var("STARFISH_TEST_GRAIN_DUMP") {
+            let grain: Vec<f32> = image
+                .pixels
+                .chunks_exact(4)
+                .map(|p| f16_to_f32(p[3]))
+                .collect();
+            std::fs::write(dump, bytemuck::cast_slice::<f32, u8>(&grain)).unwrap();
+        }
         if let Ok(dump) = std::env::var("STARFISH_TEST_DUMP") {
             let n = (image.width * image.height) as usize;
             let mut planes = vec![0f32; 3 * n];
@@ -582,14 +1028,32 @@ mod tests {
         );
 
         // The app's export with the default adjustments plus some local
-        // contrast; `STARFISH_TEST_CROP=1` also turns it a quarter clockwise
+        // contrast, fully denoised unless `STARFISH_TEST_GRAIN_AMOUNT` (0..1)
+        // puts grain back (`STARFISH_TEST_SHARPNESS` 0..1 sharpens); `STARFISH_TEST_CROP=1` also turns it a quarter clockwise
         // and crops 3:2 to 1/1.6 of the width, tilted by ~4.6 degrees.
         if let Ok(export) = std::env::var("STARFISH_TEST_EXPORT") {
             use crate::preview::{Adjustments, Aspect, Crop, Rotation};
-            let adjustments = Adjustments {
+            let mut adjustments = Adjustments {
                 local_contrast: 0.3,
+                sharpness: std::env::var("STARFISH_TEST_SHARPNESS")
+                    .map_or(0.0, |v| v.parse().unwrap()),
+                grain: std::env::var("STARFISH_TEST_GRAIN_AMOUNT")
+                    .map_or(0.0, |v| v.parse().unwrap()),
                 ..Adjustments::default()
             };
+            // `STARFISH_TEST_COLOR_EDITS=1`: strong colour mixer and grading settings.
+            if std::env::var("STARFISH_TEST_COLOR_EDITS").is_ok_and(|v| v != "0") {
+                use crate::color_edit::{GradeParam, MixParam};
+                let (mix, grading) = (&mut adjustments.color_mix, &mut adjustments.grading);
+                mix.set(0, MixParam::Saturation, -1.0); // red: grey
+                mix.set(2, MixParam::Hue, 1.0); // yellow: turned 30 degrees
+                mix.set(3, MixParam::Brightness, 1.0); // green: lighter
+                mix.set(5, MixParam::Saturation, 1.0); // blue: more colour
+                grading.set(0, GradeParam::Hue, 250.0);
+                grading.set(0, GradeParam::Amount, 1.0); // blue shadows
+                grading.set(2, GradeParam::Hue, 60.0);
+                grading.set(2, GradeParam::Amount, 1.0); // orange highlights
+            }
             let (rotation, crop) = if std::env::var("STARFISH_TEST_CROP").is_ok_and(|v| v != "0") {
                 let crop = Crop {
                     zoom: 1.6,
@@ -604,22 +1068,45 @@ mod tests {
             let format = if export.ends_with(".png") {
                 crate::export::Format::Png16
             } else {
-                crate::export::Format::JpegL
+                crate::export::Format::Jpeg
             };
             let path = std::path::Path::new(&export);
             let engine = Engine::get().unwrap();
             let drawn = engine
-                .develop(&raw, None, lens.and(Corrections::CHROMATIC), quick, &AtomicBool::new(false))
+                .develop(
+                    &raw,
+                    None,
+                    Corrections::NONE,
+                    method,
+                    &AtomicBool::new(false),
+                )
                 .unwrap();
+            let start = std::time::Instant::now();
+            crate::lens::measure(drawn.width, drawn.height, &drawn.pixels);
+            println!(
+                "measured CA (drawn): {:?} in {} ms",
+                drawn.ca.map(|ca| ca.summary()),
+                start.elapsed().as_millis()
+            );
             let view = crate::export::View {
                 adjustments,
                 rotation,
                 crop,
-                lens: lens.without(Corrections::CHROMATIC),
+                lens,
             };
             let gpu = &engine.gpu;
             let start = std::time::Instant::now();
-            crate::export::export(&gpu.device, &gpu.queue, &drawn, view, format, path).unwrap();
+            crate::export::export(
+                &gpu.device,
+                &gpu.queue,
+                &drawn,
+                view,
+                format,
+                95,
+                crate::export::Compression::Low,
+                path,
+            )
+            .unwrap();
             println!("GPU export: {} ms", start.elapsed().as_millis());
             let start = std::time::Instant::now();
             crate::histogram::Histogram::compute_on(&gpu.device, &gpu.queue, &drawn, view).unwrap();

@@ -5,11 +5,12 @@
 //! camera → sRGB matrix).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use rawler::imgop::xyz::Illuminant;
 use rawler::rawimage::{RawImage, RawImageData, RawPhotometricInterpretation};
 
-use crate::lens::LensCorrection;
+use crate::lens::{LensCorrection, Measured};
 
 /// File extensions offered in the open dialog.
 /// Both cases, because file dialogs match extensions case-sensitively and many
@@ -78,10 +79,53 @@ pub struct RawFrame {
     pub cam_to_srgb: [[f32; 3]; 3],
     /// For the temperature slider; `None` if the file's metadata is unusable.
     pub white: Option<WhiteBalance>,
+    /// The ISO in the EXIF, if any: what the noise slider's ISO is relative to.
+    pub iso: Option<f32>,
+    /// The EXIF orientation (1 = upright; 6 and 8 are the quarter turns of a
+    /// portrait shot). 1 if the file has none.
+    pub orientation: u16,
     /// Label and value rows for the metadata panel, in display order.
     pub metadata: Vec<(&'static str, String)>,
     /// The lens correction embedded in the file, if any (Fujifilm, Panasonic).
     pub lens: Option<LensCorrection>,
+    /// The lateral CA in `data`, once measured (see [`RawFrame::mosaic_ca`]).
+    mosaic_ca: OnceLock<Option<Measured>>,
+    /// The hot and dead pixels of `data`, once found (see [`RawFrame::hot_pixels`]).
+    hot_pixels: OnceLock<Vec<(usize, f32)>>,
+}
+
+impl RawFrame {
+    /// Identifies the camera body for settings that belong to one sensor
+    /// (hot pixels): the model plus the EXIF serial number, or the model
+    /// alone when the file carries none.
+    pub fn body(&self) -> String {
+        match self
+            .metadata
+            .iter()
+            .find(|(label, _)| *label == "Serial number")
+        {
+            Some((_, serial)) => format!("{} #{serial}", self.camera),
+            None => self.camera.clone(),
+        }
+    }
+
+    /// The lateral CA in the mosaic ([`crate::lens::measure_raw`]), what
+    /// `CaFix` takes out: measured on the first call (100-300 ms per 24 MP)
+    /// and kept.
+    pub fn mosaic_ca(&self) -> Option<&Measured> {
+        self.mosaic_ca
+            .get_or_init(|| crate::lens::measure_raw(self))
+            .as_ref()
+    }
+
+    /// The hot and dead pixels in `data` with what each should be, `(index,
+    /// value)` ([`crate::processing::hot_pixels`]): found on the first call
+    /// (~100 ms per 24 MP) and kept.
+    pub fn hot_pixels(&self) -> &[(usize, f32)] {
+        self.hot_pixels.get_or_init(|| {
+            crate::processing::hot_pixels::find(&self.data, self.width, self.height, &self.cfa)
+        })
+    }
 }
 
 /// What the temperature slider needs to know about the camera and the
@@ -217,10 +261,15 @@ pub fn decode(path: &Path) -> Result<RawFrame, String> {
 
     let data = crop_data(&image, crop);
     let lens = LensCorrection::read(path);
-    let mut metadata = metadata(path, &image, crop);
+    let (mut metadata, orientation) = metadata(path, &image, crop);
     if let Some(lens) = &lens {
         metadata.push(("Lens profile", lens.description()));
     }
+    let iso = metadata
+        .iter()
+        .find(|(label, _)| *label == "ISO")
+        .and_then(|(_, value)| value.parse::<f32>().ok())
+        .filter(|&iso| iso > 0.0);
 
     Ok(RawFrame {
         path: path.to_path_buf(),
@@ -236,8 +285,12 @@ pub fn decode(path: &Path) -> Result<RawFrame, String> {
         wb,
         cam_to_srgb,
         white,
+        iso,
+        orientation,
         metadata,
         lens,
+        mosaic_ca: OnceLock::new(),
+        hot_pixels: OnceLock::new(),
     })
 }
 
@@ -248,7 +301,7 @@ fn metadata(
     path: &Path,
     image: &RawImage,
     crop: (usize, usize, usize, usize),
-) -> Vec<(&'static str, String)> {
+) -> (Vec<(&'static str, String)>, u16) {
     let mut rows = Vec::new();
     let mut add = |label, value: Option<String>| {
         if let Some(value) = value.filter(|v| !v.is_empty()) {
@@ -263,6 +316,9 @@ fn metadata(
             decoder.raw_metadata(&source, &Default::default()).ok()
         });
     let e = exif.as_ref().map(|m| &m.exif);
+    // From the EXIF, not `RawImage::orientation`, which rawler leaves at
+    // Normal for everything but DNG.
+    let orientation = e.and_then(|e| e.orientation).unwrap_or(1);
     let rational = |r: rawler::formats::tiff::Rational| (r.d != 0).then(|| r.n as f64 / r.d as f64);
     let srational =
         |r: rawler::formats::tiff::SRational| (r.d != 0).then(|| r.n as f64 / r.d as f64);
@@ -271,6 +327,7 @@ fn metadata(
         "Camera",
         Some(format!("{} {}", image.clean_make, image.clean_model)),
     );
+    add("Serial number", e.and_then(|e| e.serial_number.clone()));
     add(
         "Lens",
         exif.as_ref()
@@ -300,6 +357,23 @@ fn metadata(
         e.and_then(|e| e.fnumber)
             .and_then(rational)
             .map(|v| format!("f/{v:.1}")),
+    );
+    add(
+        "Focus distance",
+        e.and_then(|e| e.subject_distance).and_then(|r| {
+            // EXIF: 0 = unknown, 0xFFFFFFFF = infinity.
+            if r.n == 0xFFFF_FFFF {
+                Some("∞".to_string())
+            } else {
+                rational(r).filter(|&m| m > 0.0).map(|m| {
+                    if m < 10.0 {
+                        format!("{m:.2} m")
+                    } else {
+                        format!("{m:.0} m")
+                    }
+                })
+            }
+        }),
     );
     add(
         "Shutter",
@@ -340,7 +414,7 @@ fn metadata(
         "File",
         path.file_name().map(|n| n.to_string_lossy().into_owned()),
     );
-    rows
+    (rows, orientation)
 }
 
 /// Cuts out the crop and normalises it per site: black → 0, white → 1.
@@ -415,7 +489,11 @@ fn cam_to_srgb(image: &RawImage) -> [[f32; 3]; 3] {
     ];
     const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
-    let xyz_to_cam = image.xyz_to_cam;
+    // rawler's own `xyz_to_cam` field is deprecated and all zeros, which
+    // made this the identity for every camera until 2026-11-14
+    let Some(xyz_to_cam) = xyz_to_cam(image) else {
+        return IDENTITY;
+    };
     let mut srgb_to_cam = [[0.0f32; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
@@ -470,6 +548,60 @@ mod tests {
             [0.0556434, -0.2040259, 1.0572252],
         ];
         WhiteBalance::new(xyz_to_srgb, [1.0, 1.0, 1.0]).unwrap()
+    }
+
+    /// Writes `STARFISH_TEST_RAW`'s mosaic and its CA table to
+    /// `STARFISH_TEST_MOSAIC`, for estimating CA offline: u32 height, width,
+    /// cfa width, cfa height, the cfa colours (u32 each); f32 wb[3], half
+    /// diagonal, then [`crate::lens::LUT_SIZE`] (red, blue) CA pairs up to
+    /// [`crate::lens::LUT_RHO_MAX`] (zero if none), then the samples.
+    #[test]
+    #[ignore]
+    fn dump_mosaic() {
+        let (Ok(raw), Ok(out)) = (
+            std::env::var("STARFISH_TEST_RAW"),
+            std::env::var("STARFISH_TEST_MOSAIC"),
+        ) else {
+            return;
+        };
+        let frame = decode(Path::new(&raw)).unwrap();
+        let (w, h) = (frame.width as u32, frame.height as u32);
+        let only_ca = crate::lens::Corrections {
+            distortion: false,
+            vignetting: false,
+            chromatic: true,
+        };
+        let (half_diagonal, lut) = match &frame.lens {
+            Some(lens) => lens.lut(w, h, only_ca),
+            None => (
+                (w as f32).hypot(h as f32) / 2.0,
+                vec![[1.0, 0.0, 0.0, 1.0]; crate::lens::LUT_SIZE],
+            ),
+        };
+        let mut bytes = Vec::new();
+        let cfa = &frame.cfa;
+        for v in [h, w, cfa.width as u32, cfa.height as u32]
+            .into_iter()
+            .chain(cfa.colors.iter().copied())
+        {
+            bytes.extend(v.to_le_bytes());
+        }
+        let floats = frame
+            .wb
+            .iter()
+            .copied()
+            .chain([half_diagonal])
+            .chain(lut.iter().flat_map(|e| [e[1], e[2]]));
+        for v in floats.chain(frame.data.iter().copied()) {
+            bytes.extend(v.to_le_bytes());
+        }
+        std::fs::write(&out, bytes).unwrap();
+        eprintln!(
+            "{}: {} {w}x{h}, lens {:?}",
+            raw,
+            frame.camera,
+            frame.lens.as_ref().map(|l| l.available())
+        );
     }
 
     #[test]

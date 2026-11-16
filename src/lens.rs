@@ -76,6 +76,9 @@
 //! cameras beyond that are untested.
 
 mod canon;
+mod measure;
+
+pub use measure::{Measured, measure, measure_raw};
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -137,13 +140,6 @@ impl Corrections {
         distortion: false,
         vignetting: false,
         chromatic: false,
-    };
-
-    /// What the demosaic stage applies (`LensPass`); distortion and
-    /// vignetting are applied where the image is drawn (`develop.wgsl`).
-    pub const CHROMATIC: Self = Self {
-        chromatic: true,
-        ..Self::NONE
     };
 
     pub fn get(self, kind: Kind) -> bool {
@@ -400,7 +396,8 @@ impl LensCorrection {
         // Tables that do nothing are not worth a pass over the image.
         let distortion = distortion.filter(Distortion::does_something);
         let vignetting = vignetting.filter(|c| c.values.iter().any(|&v| v < 100.0));
-        let chromatic = chromatic.filter(|(r, b)| r.values.iter().chain(&b.values).any(|&c| c != 0.0));
+        let chromatic =
+            chromatic.filter(|(r, b)| r.values.iter().chain(&b.values).any(|&c| c != 0.0));
         if distortion.is_none() && vignetting.is_none() && chromatic.is_none() {
             return None;
         }
@@ -431,9 +428,13 @@ impl LensCorrection {
             .collect();
         // 100% is the first value (8191, or 8199 for some).
         let unity = *tables.vignetting.first()?;
-        let percent: Vec<f64> = tables.vignetting.iter().map(|v| 100.0 * v / unity).collect();
-        let vignetting = Curve::new(&radii, &percent, 100.0)
-            .filter(|c| c.values.iter().any(|&v| v < 100.0));
+        let percent: Vec<f64> = tables
+            .vignetting
+            .iter()
+            .map(|v| 100.0 * v / unity)
+            .collect();
+        let vignetting =
+            Curve::new(&radii, &percent, 100.0).filter(|c| c.values.iter().any(|&v| v < 100.0));
         let distortion = tables.distortion.as_ref().and_then(|d| {
             let ratios: Vec<f64> = d.iter().map(|v| v / 16384.0).collect();
             Some(Distortion::Ratio(Curve::new(&radii, &ratios, 1.0)?))
@@ -469,11 +470,17 @@ impl LensCorrection {
         let offsets = if subifds.count == 1 {
             vec![u32_le(&subifds.value)?]
         } else {
-            let raw = tiff.read(&mut file, u32_le(&subifds.value)? as u64, subifds.count as usize * 4)?;
+            let raw = tiff.read(
+                &mut file,
+                u32_le(&subifds.value)? as u64,
+                subifds.count as usize * 4,
+            )?;
             raw.chunks_exact(4).filter_map(u32_le).collect()
         };
         for offset in offsets {
-            let Some(ifd) = tiff.ifd(&mut file, offset as u64) else { continue };
+            let Some(ifd) = tiff.ifd(&mut file, offset as u64) else {
+                continue;
+            };
             if !ifd.iter().any(|e| e.tag == 0x7037) {
                 continue;
             }
@@ -483,11 +490,23 @@ impl LensCorrection {
                 if entry.kind != 8 || entry.count < 3 || entry.count > 64 {
                     return None;
                 }
-                let data = tiff.read(&mut file, u32_le(&entry.value)? as u64, entry.count as usize * 2)?;
-                Some(data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+                let data = tiff.read(
+                    &mut file,
+                    u32_le(&entry.value)? as u64,
+                    entry.count as usize * 2,
+                )?;
+                Some(
+                    data.chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                        .collect(),
+                )
             };
             let (distortion, vignetting, chromatic) = (table(0x7037), table(0x7032), table(0x7035));
-            return Self::from_sony_tables(distortion.as_deref(), vignetting.as_deref(), chromatic.as_deref());
+            return Self::from_sony_tables(
+                distortion.as_deref(),
+                vignetting.as_deref(),
+                chromatic.as_deref(),
+            );
         }
         None
     }
@@ -520,7 +539,10 @@ impl LensCorrection {
         // Brightness percent left after an assumed `value / SONY_VIGNETTING_UNIT` stops.
         let vignetting = vignetting.and_then(|w| {
             let (knots, v) = values(w, counted(w)?, 1)?;
-            let percent: Vec<f64> = v.iter().map(|s| 100.0 * (-s / SONY_VIGNETTING_UNIT).exp2()).collect();
+            let percent: Vec<f64> = v
+                .iter()
+                .map(|s| 100.0 * (-s / SONY_VIGNETTING_UNIT).exp2())
+                .collect();
             Curve::new(&knots, &percent, 100.0)
         });
         // Red then blue, each half of the leading count.
@@ -536,7 +558,8 @@ impl LensCorrection {
 
         let distortion = distortion.filter(Distortion::does_something);
         let vignetting = vignetting.filter(|c| c.values.iter().any(|&v| v < 100.0));
-        let chromatic = chromatic.filter(|(r, b)| r.values.iter().chain(&b.values).any(|&c| c != 0.0));
+        let chromatic =
+            chromatic.filter(|(r, b)| r.values.iter().chain(&b.values).any(|&c| c != 0.0));
         let profile = Self {
             half_diagonal: None,
             unverified: Corrections {
@@ -557,7 +580,9 @@ impl LensCorrection {
         let tiff = Tiff { base: 0 };
         let header = tiff.read(&mut file, 0, 8)?;
         let ifd = tiff.ifd(&mut file, u32_le(&header[4..])? as u64)?;
-        let entry = ifd.iter().find(|e| e.tag == 0x119 && e.kind == 7 && e.count == 32)?;
+        let entry = ifd
+            .iter()
+            .find(|e| e.tag == 0x119 && e.kind == 7 && e.count == 32)?;
         let block = tiff.read(&mut file, u32_le(&entry.value)? as u64, 32)?;
         let words: Vec<i16> = block
             .chunks_exact(2)
@@ -599,6 +624,40 @@ impl LensCorrection {
         self.unverified
     }
 
+    /// The profile the app draws: `profile`'s distortion and vignetting, with
+    /// the CA `measured` in the image instead of the table's (see
+    /// [`measure`]), for an image of `width` × `height`. `None` if that
+    /// leaves nothing to correct.
+    pub fn drawn(
+        profile: Option<&LensCorrection>,
+        measured: Option<&Measured>,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        let mut drawn = profile.cloned().unwrap_or(Self {
+            half_diagonal: None,
+            distortion: None,
+            vignetting: None,
+            chromatic: None,
+            unverified: Corrections::NONE,
+        });
+        drawn.unverified.chromatic = false;
+        // The curves at the profile's own unit radius.
+        let unit = drawn.half_diagonal(width, height);
+        drawn.chromatic = measured.and_then(|m| {
+            let knots: Vec<f64> = (0..=48).map(|i| (i as f32 / 32.0) as f64).collect();
+            let curve = |c| {
+                let values: Vec<f64> = knots
+                    .iter()
+                    .map(|&k| m.scale(c, k as f32 * unit / m.radius) as f64)
+                    .collect();
+                Curve::new(&knots, &values, 0.0)
+            };
+            Some((curve(0)?, curve(1)?))
+        });
+        drawn.available().any().then_some(drawn)
+    }
+
     /// The corrections the profile has data for.
     pub fn available(&self) -> Corrections {
         Corrections {
@@ -635,6 +694,8 @@ impl LensCorrection {
     /// the unit radius in pixels and a table over the normalised radius of
     /// [`LUT_SIZE`] entries up to [`LUT_RHO_MAX`], each
     /// `[source radius / output radius, red CA, blue CA, vignetting gain]`.
+    /// `LensPass` looks the CA up at the output radius, the develop shader
+    /// (for a measured CA, see [`LensCorrection::drawn`]) at the source one.
     ///
     /// The correction samples the source at `r_out · scale(r_out)`, which
     /// each distortion model works out for itself (Fuji's keeps the picture
@@ -652,10 +713,8 @@ impl LensCorrection {
             .map(|i| {
                 let rho = i as f32 / (LUT_SIZE - 1) as f32 * LUT_RHO_MAX;
                 let scale = distortion.map_or(1.0, |d| d.ratio(rho, short_edge));
-                let (red, blue) =
-                    chromatic.map_or((0.0, 0.0), |(r, b)| (r.at(rho), b.at(rho)));
-                let gain = vignetting
-                    .map_or(1.0, |v| (100.0 / v.at(rho).max(1.0)).min(MAX_GAIN));
+                let (red, blue) = chromatic.map_or((0.0, 0.0), |(r, b)| (r.at(rho), b.at(rho)));
+                let gain = vignetting.map_or(1.0, |v| (100.0 / v.at(rho).max(1.0)).min(MAX_GAIN));
                 [scale, red, blue, gain]
             })
             .collect();
@@ -755,8 +814,12 @@ mod tests {
     /// leaves centred on the middle of the short edge.
     #[test]
     fn zoom_keeps_the_short_edge() {
-        let knots = [0.35352, 0.5, 0.61268, 0.70704, 0.79085, 0.8662, 0.93521, 1.0, 1.0606];
-        let values = [-1.5435, -3.4292, -5.1575, -6.7492, -8.312, -9.6693, -10.782, -11.68, -12.578];
+        let knots = [
+            0.35352, 0.5, 0.61268, 0.70704, 0.79085, 0.8662, 0.93521, 1.0, 1.0606,
+        ];
+        let values = [
+            -1.5435, -3.4292, -5.1575, -6.7492, -8.312, -9.6693, -10.782, -11.68, -12.578,
+        ];
         let lens = LensCorrection {
             half_diagonal: Some(3749.0),
             distortion: Some(Distortion::Percent(curve(&knots, &values, 0.0))),
@@ -783,7 +846,10 @@ mod tests {
             half_diagonal: Some(1000.0),
             distortion: Some(Distortion::Percent(curve(&knots, &[-5.0, -10.0], 0.0))),
             vignetting: Some(curve(&knots, &[80.0, 60.0], 100.0)),
-            chromatic: Some((curve(&knots, &[0.001, 0.002], 0.0), curve(&knots, &[-0.001, -0.002], 0.0))),
+            chromatic: Some((
+                curve(&knots, &[0.001, 0.002], 0.0),
+                curve(&knots, &[-0.001, -0.002], 0.0),
+            )),
             unverified: Corrections::NONE,
         };
         let only = |kind: Kind| {
@@ -804,8 +870,12 @@ mod tests {
     /// pull the corners in (the short edge rule would leave them blank).
     #[test]
     fn fuji_pincushion_zoom_keeps_the_corners_inside() {
-        let knots = [0.35352, 0.5, 0.61268, 0.70704, 0.79085, 0.8662, 0.93521, 1.0, 1.0606];
-        let values = [0.106, 0.21362, 0.3116, 0.40958, 0.49791, 0.57501, 0.65372, 0.71153, 0.76936];
+        let knots = [
+            0.35352, 0.5, 0.61268, 0.70704, 0.79085, 0.8662, 0.93521, 1.0, 1.0606,
+        ];
+        let values = [
+            0.106, 0.21362, 0.3116, 0.40958, 0.49791, 0.57501, 0.65372, 0.71153, 0.76936,
+        ];
         let lens = LensCorrection {
             half_diagonal: Some(3749.0),
             distortion: Some(Distortion::Percent(curve(&knots, &values, 0.0))),
@@ -815,7 +885,11 @@ mod tests {
         };
         let (_, lut) = lens.lut(6240, 4160, Corrections::ALL);
         // The corner samples exactly at the corner, no further.
-        assert!((ratio_at(&lut, 1.0) - 1.0).abs() < 1e-3, "{}", ratio_at(&lut, 1.0));
+        assert!(
+            (ratio_at(&lut, 1.0) - 1.0).abs() < 1e-3,
+            "{}",
+            ratio_at(&lut, 1.0)
+        );
     }
 
     /// Real A6700 words: the 15mm f/1.4 (strong barrel) and, from an A7 III,
@@ -824,7 +898,9 @@ mod tests {
         11, 0, -27, -101, -218, -368, -548, -755, -988, -1246, -1527, -1833, -1833, -1833, -1833,
         -1833, -1833,
     ];
-    const SONY_55MM: [i16; 17] = [16, -8, -2, 5, 13, 23, 34, 46, 58, 69, 79, 87, 91, 88, 76, 54, 16];
+    const SONY_55MM: [i16; 17] = [
+        16, -8, -2, 5, 13, 23, 34, 46, 58, 69, 79, 87, 91, 88, 76, 54, 16,
+    ];
     /// The 15mm f/1.4 vignetting and CA words of the same shot.
     const SONY_15MM_VIGNETTING: [i16; 17] = [
         11, 0, 48, 224, 512, 912, 1424, 2048, 2768, 3776, 4992, 6208, 0, 0, 0, 0, 0,
@@ -846,7 +922,11 @@ mod tests {
         // Only the CA unit is a guess.
         assert_eq!(
             lens.unverified(),
-            Corrections { distortion: false, vignetting: false, chromatic: true }
+            Corrections {
+                distortion: false,
+                vignetting: false,
+                chromatic: true
+            }
         );
         let only = |kind: Kind| {
             let mut on = Corrections::NONE;
@@ -866,21 +946,39 @@ mod tests {
         // Missing or empty tables are simply absent; all-empty is no profile.
         let flat = LensCorrection::from_sony_tables(Some(&SONY_15MM), None, None).unwrap();
         assert_eq!(flat.unverified(), Corrections::NONE);
-        assert!(LensCorrection::from_sony_tables(None, Some(&[11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), None).is_none());
+        assert!(
+            LensCorrection::from_sony_tables(
+                None,
+                Some(&[11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                None
+            )
+            .is_none()
+        );
         // `without` is what the program uses to leave guesses off.
         assert_eq!(
             Corrections::ALL.without(lens.unverified()),
-            Corrections { chromatic: false, ..Corrections::ALL }
+            Corrections {
+                chromatic: false,
+                ..Corrections::ALL
+            }
         );
     }
 
     /// An A6700 table that is pincushion: the corners map to themselves.
-    const SONY_39MM: [i16; 17] = [11, 0, 2, 10, 21, 39, 64, 97, 140, 196, 269, 368, 368, 368, 368, 368, 368];
+    const SONY_39MM: [i16; 17] = [
+        11, 0, 2, 10, 21, 39, 64, 97, 140, 196, 269, 368, 368, 368, 368, 368, 368,
+    ];
 
     #[test]
     fn sony_distortion_uses_the_unit_and_the_zoom_rule() {
         let barrel = LensCorrection::from_sony_tables(Some(&SONY_15MM), None, None).unwrap();
-        assert_eq!(barrel.available(), Corrections { distortion: true, ..Corrections::NONE });
+        assert_eq!(
+            barrel.available(),
+            Corrections {
+                distortion: true,
+                ..Corrections::NONE
+            }
+        );
         let (half_diagonal, lut) = barrel.lut(6192, 4128, Corrections::ALL);
         assert_eq!(half_diagonal, (6192f32).hypot(4128.0) / 2.0);
         // Middle of the short edge stays put; zoom = 1/(1 - 988/16384...).
@@ -893,12 +991,23 @@ mod tests {
 
         let pincushion = LensCorrection::from_sony_tables(Some(&SONY_39MM), None, None).unwrap();
         let lut = pincushion.lut(6192, 4128, Corrections::ALL).1;
-        assert!((ratio_at(&lut, 1.0) - 1.0).abs() < 2e-3, "{}", ratio_at(&lut, 1.0));
+        assert!(
+            (ratio_at(&lut, 1.0) - 1.0).abs() < 2e-3,
+            "{}",
+            ratio_at(&lut, 1.0)
+        );
 
         // The A7 III table has 16 points and a non-monotonic shape.
         assert!(LensCorrection::from_sony_tables(Some(&SONY_55MM), None, None).is_some());
         // Nothing to do, or nonsense counts.
-        assert!(LensCorrection::from_sony_tables(Some(&[11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), None, None).is_none());
+        assert!(
+            LensCorrection::from_sony_tables(
+                Some(&[11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                None,
+                None
+            )
+            .is_none()
+        );
         assert!(LensCorrection::from_sony_tables(Some(&[40, 1, 2, 3]), None, None).is_none());
         assert!(LensCorrection::from_sony_tables(Some(&[]), None, None).is_none());
     }
@@ -930,7 +1039,13 @@ mod tests {
     #[test]
     fn panasonic_polynomial_inverts_and_zooms() {
         let lens = LensCorrection::from_panasonic_block(S5M2_85MM).unwrap();
-        assert_eq!(lens.available(), Corrections { distortion: true, ..Corrections::NONE });
+        assert_eq!(
+            lens.available(),
+            Corrections {
+                distortion: true,
+                ..Corrections::NONE
+            }
+        );
         let (half_diagonal, lut) = lens.lut(6000, 4000, Corrections::ALL);
         assert_eq!(half_diagonal, 3606.0);
         // Centre: just the zoom, 1 + word5/32768.
@@ -940,7 +1055,10 @@ mod tests {
         for i in [40, 120, 200] {
             let rho = i as f32 / (LUT_SIZE - 1) as f32 * LUT_RHO_MAX;
             let s = lut[i][0] * rho / (1.0 - 439.0 / 32768.0);
-            let back = s * (1.0 + s * s * (-640.0 / 32768.0 + s * s * (82.0 / 32768.0 + s * s * 153.0 / 32768.0)));
+            let back = s
+                * (1.0
+                    + s * s
+                        * (-640.0 / 32768.0 + s * s * (82.0 / 32768.0 + s * s * 153.0 / 32768.0)));
             assert!((back - rho).abs() < 1e-4, "{back} vs {rho}");
         }
         // The wide shot is the barrel one: the corner samples inside.
@@ -973,19 +1091,19 @@ mod tests {
     /// pitch makes a knot 0.62 pixels.
     fn canon_r50(applied: Option<canon::Applied>) -> canon::Tables {
         let knots: Vec<f64> = [
-            0, 189, 379, 568, 757, 946, 1136, 1325, 1514, 1703, 1893, 1987, 2082, 2177, 2271, 2366, 2461,
-            2555, 2650, 2745, 2839, 2934,
+            0, 189, 379, 568, 757, 946, 1136, 1325, 1514, 1703, 1893, 1987, 2082, 2177, 2271, 2366,
+            2461, 2555, 2650, 2745, 2839, 2934,
         ]
         .iter()
         .map(|&k| k as f64)
         .collect();
         let vignetting = [
-            8191, 8179, 8140, 8075, 7985, 7867, 7723, 7555, 7363, 7134, 6695, 6361, 6002, 5606, 5198, 4791,
-            4382, 3975, 3566, 3159, 2750, 2342,
+            8191, 8179, 8140, 8075, 7985, 7867, 7723, 7555, 7363, 7134, 6695, 6361, 6002, 5606,
+            5198, 4791, 4382, 3975, 3566, 3159, 2750, 2342,
         ];
         let distortion = [
-            16384, 16311, 16266, 16192, 16087, 15956, 15802, 15627, 15438, 15238, 15029, 14922, 14815,
-            14706, 14598, 14489, 14380, 14273, 14166, 14059, 13957, 13861,
+            16384, 16311, 16266, 16192, 16087, 15956, 15802, 15627, 15438, 15238, 15029, 14922,
+            14815, 14706, 14598, 14489, 14380, 14273, 14166, 14059, 13957, 13861,
         ];
         canon::Tables {
             pitch_nm: 3720.0,
@@ -1000,23 +1118,40 @@ mod tests {
 
     #[test]
     fn canon_tables_become_a_profile_in_pixels_with_the_shared_zoom() {
-        let applied = canon::Applied { vignetting: true, distortion: true };
+        let applied = canon::Applied {
+            vignetting: true,
+            distortion: true,
+        };
         let lens = LensCorrection::from_canon(&canon_r50(Some(applied))).unwrap();
-        assert_eq!(lens.available(), Corrections { chromatic: false, ..Corrections::ALL });
+        assert_eq!(
+            lens.available(),
+            Corrections {
+                chromatic: false,
+                ..Corrections::ALL
+            }
+        );
         assert_eq!(lens.unverified(), Corrections::NONE);
         let (half_diagonal, lut) = lens.lut(6000, 4000, Corrections::ALL);
         assert!((half_diagonal - 3605.55).abs() < 0.01);
         // The middle of the short edge (rho 0.5547) is the tightest edge
         // point, so it keeps its place and the zoom is 1 / its table ratio.
         let short_edge = 2000.0 / half_diagonal;
-        assert!((ratio_at(&lut, short_edge) - 1.0).abs() < 2e-3, "{}", ratio_at(&lut, short_edge));
+        assert!(
+            (ratio_at(&lut, short_edge) - 1.0).abs() < 2e-3,
+            "{}",
+            ratio_at(&lut, short_edge)
+        );
         // 600 / 16384-ish at the centre: the zoom pushes it above 1.
         let zoom = ratio_at(&lut, 0.0);
         assert!((1.03..1.06).contains(&zoom), "{zoom}");
         // The corner is knot 3605.55 * 3720 / 6000 = 2235.4: between 2177
         // (14706) and 2271 (14598), 0.62 of the way: 14639 / 16384, zoomed.
         let expected = zoom * 14639.0 / 16384.0;
-        assert!((ratio_at(&lut, 1.0) - expected).abs() < 2e-3, "{}", ratio_at(&lut, 1.0));
+        assert!(
+            (ratio_at(&lut, 1.0) - expected).abs() < 2e-3,
+            "{}",
+            ratio_at(&lut, 1.0)
+        );
         // Vignetting: 8191 / 5353 at the same knot.
         let gain = column_at(&lut, 1.0, 3);
         assert!((gain - 8191.0 / 5353.0).abs() < 0.01, "{gain}");
@@ -1025,20 +1160,44 @@ mod tests {
     #[test]
     fn canon_corrections_are_verified_only_where_the_camera_applied_them() {
         // The camera applied distortion but not the peripheral lighting.
-        let applied = canon::Applied { vignetting: false, distortion: true };
+        let applied = canon::Applied {
+            vignetting: false,
+            distortion: true,
+        };
         let lens = LensCorrection::from_canon(&canon_r50(Some(applied))).unwrap();
-        assert_eq!(lens.unverified(), Corrections { vignetting: true, ..Corrections::NONE });
+        assert_eq!(
+            lens.unverified(),
+            Corrections {
+                vignetting: true,
+                ..Corrections::NONE
+            }
+        );
         // Without the camera's settings nothing is confirmed.
         let lens = LensCorrection::from_canon(&canon_r50(None)).unwrap();
-        assert_eq!(lens.unverified(), Corrections { chromatic: false, ..Corrections::ALL });
+        assert_eq!(
+            lens.unverified(),
+            Corrections {
+                chromatic: false,
+                ..Corrections::ALL
+            }
+        );
     }
 
     #[test]
     fn canon_vignetting_alone_is_a_profile() {
-        let mut tables = canon_r50(Some(canon::Applied { vignetting: true, distortion: false }));
+        let mut tables = canon_r50(Some(canon::Applied {
+            vignetting: true,
+            distortion: false,
+        }));
         tables.distortion = None;
         let lens = LensCorrection::from_canon(&tables).unwrap();
-        assert_eq!(lens.available(), Corrections { vignetting: true, ..Corrections::NONE });
+        assert_eq!(
+            lens.available(),
+            Corrections {
+                vignetting: true,
+                ..Corrections::NONE
+            }
+        );
         // A flat table does nothing.
         tables.vignetting = vec![8191.0; 22];
         assert!(LensCorrection::from_canon(&tables).is_none());

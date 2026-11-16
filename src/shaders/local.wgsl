@@ -109,5 +109,7 @@ fn fs_overview(in: VertexOut) -> @location(0) vec4<f32> {
     // The centre of the block of (corrected) image pixels under this
     // overview pixel, through the lens correction, as the preview draws it.
     let at = lens_source(lens_lut, params.lens, in.position.xy * exp2(params.level));
-    return vec4<f32>(sample_source(source, source_samp, params.grid, at.xy, params.level) * at.z, 1.0);
+    // without grain: the base is smooth; without CA, a fraction of a pixel
+    // at the overview's scale
+    return vec4<f32>(sample_source(source, source_samp, params.grid, at.green, params.level, 0.0) * at.gain, 1.0);
 }
